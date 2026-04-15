@@ -8,13 +8,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+import psycopg
 import requests
-
-# Sem override: em Docker, DATABASE_URL etc. vêm do Compose e não podem ser
-# substituídos pelo .env (ex.: 127.0.0.1:5433 quebraria a ligação a `postgres`).
-load_dotenv()
 
 from sdr_ilha_ar.channel import handle_evolution_inbound, parse_evolution_inbound
 from sdr_ilha_ar.dashboard_api import router as dashboard_router
@@ -24,6 +21,20 @@ app = FastAPI(title="SDR Ilha Ar Webhook API", version="1.0.0")
 app.include_router(dashboard_router)
 logger = logging.getLogger(__name__)
 DEBOUNCE_SECONDS = 12
+
+
+@app.exception_handler(psycopg.ProgrammingError)
+async def _pg_programming_error(_request: Request, exc: psycopg.ProgrammingError) -> JSONResponse:
+    msg = str(exc).strip()
+    if "does not exist" in msg:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Tabelas em falta no Postgres. Suba a API com a imagem atual (aplica db/schema.sql no arranque) ou rode no servidor: docker compose exec -T postgres psql -U sdr -d sdr < db/schema.sql",
+                "postgres": msg,
+            },
+        )
+    return JSONResponse(status_code=500, content={"detail": msg})
 
 
 @dataclass
@@ -166,6 +177,10 @@ async def health() -> dict[str, str]:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    try:
+        repo.bootstrap_db_schema()
+    except Exception:
+        logger.exception("Falha ao aplicar db/schema.sql no startup")
     try:
         repo.ensure_finance_schema()
     except Exception:

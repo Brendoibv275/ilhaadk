@@ -10,6 +10,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
+# Carrega .env antes de ler o ambiente (workers, testes, Docker com env_file).
+# Sem override=True: variáveis já definidas (ex.: DATABASE_URL no Compose) mantêm-se.
+load_dotenv()
+
 
 @dataclass(frozen=True)
 class Settings:

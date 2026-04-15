@@ -7,10 +7,14 @@
 
 from __future__ import annotations
 
+import logging
+import shutil
+import subprocess
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 import time
 from typing import Any, Iterator
 
@@ -20,6 +24,8 @@ from psycopg.types.json import Json
 
 from sdr_ilha_ar.config import settings
 from sdr_ilha_ar import state_machine
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_LEAD_FIELDS = frozenset(
     {
@@ -109,6 +115,39 @@ def _jsonify_value(v: Any) -> Any:
 
 def _jsonify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{k: _jsonify_value(val) for k, val in r.items()} for r in rows]
+
+
+def bootstrap_db_schema() -> None:
+    """Aplica ``db/schema.sql`` com ``psql`` (idempotente). Requer cliente no PATH."""
+    if not shutil.which("psql"):
+        logger.warning("psql não encontrado; aplique db/schema.sql manualmente no Postgres")
+        return
+    try:
+        url = _require_url()
+    except DatabaseNotConfiguredError:
+        logger.warning("DATABASE_URL ausente; bootstrap do schema ignorado")
+        return
+
+    path = Path(__file__).resolve().parents[1] / "db" / "schema.sql"
+    if not path.is_file():
+        logger.warning("db/schema.sql não encontrado em %s", path)
+        return
+
+    proc = subprocess.run(
+        ["psql", url, "-f", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        logger.error(
+            "Falha ao aplicar schema (exit %s). stderr=%s stdout=%s",
+            proc.returncode,
+            proc.stderr,
+            proc.stdout,
+        )
+        return
+    logger.info("db/schema.sql aplicado (bootstrap)")
 
 
 def ensure_lead(
