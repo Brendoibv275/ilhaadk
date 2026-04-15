@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import time
 from typing import Any, Iterator
@@ -86,6 +86,29 @@ def connect() -> Iterator[psycopg.Connection]:
         raise
     finally:
         conn.close()
+
+
+def _jsonify_value(v: Any) -> Any:
+    """Garante tipos compatíveis com JSON (UUID, datas, Numeric, JSONB aninhado)."""
+    if v is None:
+        return None
+    if isinstance(v, uuid.UUID):
+        return str(v)
+    if isinstance(v, Decimal):
+        return str(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, dict):
+        return {k: _jsonify_value(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_jsonify_value(x) for x in v]
+    if isinstance(v, (bytes, memoryview)):
+        return bytes(v).decode("utf-8", errors="replace")
+    return v
+
+
+def _jsonify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{k: _jsonify_value(val) for k, val in r.items()} for r in rows]
 
 
 def ensure_lead(
@@ -404,7 +427,7 @@ def dashboard_upcoming_appointments(limit: int = 50) -> list[dict[str, Any]]:
                 """,
                 (limit,),
             )
-            return [dict(r) for r in cur.fetchall()]
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
 
 
 def dashboard_jobs(limit: int = 100) -> list[dict[str, Any]]:
@@ -420,7 +443,7 @@ def dashboard_jobs(limit: int = 100) -> list[dict[str, Any]]:
                 """,
                 (limit,),
             )
-            return [dict(r) for r in cur.fetchall()]
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
 
 
 def dashboard_recent_messages(limit: int = 200) -> list[dict[str, Any]]:
@@ -436,7 +459,7 @@ def dashboard_recent_messages(limit: int = 200) -> list[dict[str, Any]]:
                 """,
                 (limit,),
             )
-            return [dict(r) for r in cur.fetchall()]
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
 
 
 def create_finance_entry(
@@ -492,7 +515,7 @@ def dashboard_finance_entries(limit: int = 200) -> list[dict[str, Any]]:
                 """,
                 (limit,),
             )
-            return [dict(r) for r in cur.fetchall()]
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
 
 
 def dashboard_finance_summary() -> dict[str, Any]:

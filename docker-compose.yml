@@ -9,6 +9,8 @@ services:
       - "5433:5432"
     volumes:
       - sdr_pgdata:/var/lib/postgresql/data
+      # Primeira subida: Postgres aplica o schema. Volume já existente: ver README / comando psql manual.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/10-ilha-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sdr -d sdr"]
       interval: 10s
