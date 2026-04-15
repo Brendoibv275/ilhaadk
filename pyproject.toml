@@ -1,0 +1,38 @@
+[project]
+name = "sdr-ilha-ar"
+version = "0.1.0"
+description = "SDR pré-vendas Ilha Ar: agente ADK + Postgres + workers (notificação, follow-up, NPS, agenda stub)."
+readme = "README.md"
+license = { text = "Apache License 2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "google-adk>=1.0.0,<2.0.0",
+    "google-genai>=1.0.0",
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+    "requests>=2.32.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+]
+
+[project.scripts]
+sdr-workers = "sdr_ilha_ar.workers.cli:main"
+
+[tool.ruff]
+extend = "../../../pyproject.toml"
+
+[tool.ruff.lint.isort]
+known-first-party = ["sdr_ilha_ar"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sdr_ilha_ar"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,369 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+
+"""
+Adaptador de canal: inbound (mensagem do cliente) -> ADK Runner -> texto de resposta.
+
+Use com WhatsApp Business API ou outro webhook HTTP. Produção: substituir
+`InMemoryRunner` por `Runner` + `DatabaseSessionService` (ou equivalente) para
+histórico persistente entre reinícios do processo.
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import uuid
+import re
+from urllib import request
+from typing import Any
+
+from google import genai
+from google.adk.runners import InMemoryRunner
+from google.genai import types
+
+from sdr_ilha_ar.config import settings
+from sdr_ilha_ar.llm_app import root_agent
+from sdr_ilha_ar import repository as lead_repo
+
+logger = logging.getLogger(__name__)
+
+_runner: InMemoryRunner | None = None
+
+FALLBACK_REPLY = (
+    "Recebi sua mensagem certinho. Se puder, me manda novamente para eu confirmar "
+    "seu atendimento agora."
+)
+TRANSCRIBE_PROMPT = (
+    "Transcreva este áudio em português do Brasil. "
+    "Retorne apenas o texto transcrito, sem comentários."
+)
+
+
+def _runner_singleton() -> InMemoryRunner:
+    global _runner
+    if _runner is None:
+        _runner = InMemoryRunner(agent=root_agent, app_name=settings.app_name)
+    return _runner
+
+
+async def handle_inbound_text(
+    *,
+    external_user_id: str,
+    text: str,
+    external_channel: str | None = None,
+) -> str:
+    """
+    Uma rodada do SDR. `external_user_id` costuma ser o wa_id ou id estável do lead.
+
+    `session_id` = `external_user_id` para manter o fio da conversa no InMemoryRunner.
+    """
+    runner = _runner_singleton()
+    app_name = runner.app_name
+    channel = external_channel or settings.default_external_channel
+    session_id = external_user_id
+
+    existing = await runner.session_service.get_session(
+        app_name=app_name,
+        user_id=external_user_id,
+        session_id=session_id,
+    )
+    if existing is None:
+        await runner.session_service.create_session(
+            app_name=app_name,
+            user_id=external_user_id,
+            session_id=session_id,
+        )
+        created = await runner.session_service.get_session(
+            app_name=app_name,
+            user_id=external_user_id,
+            session_id=session_id,
+        )
+        if created is not None:
+            created.state["external_channel"] = channel
+    else:
+        existing.state.setdefault("external_channel", channel)
+
+    content = types.Content(role="user", parts=[types.Part(text=text)])
+    final_text = ""
+    try:
+        async for event in runner.run_async(
+            user_id=external_user_id,
+            session_id=session_id,
+            new_message=content,
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        final_text = part.text
+    except Exception:
+        logger.exception("Falha ao processar rodada do agente para user=%s", external_user_id)
+        return (
+            "Obrigada pelas informações! Nosso sistema teve uma instabilidade rápida, "
+            "mas sua solicitação já foi recebida e vamos te responder em seguida."
+        )
+    if not final_text.strip():
+        logger.warning("Resposta final vazia para user=%s", external_user_id)
+    return final_text.strip() or FALLBACK_REPLY
+
+
+def handle_inbound_text_sync(
+    *,
+    external_user_id: str,
+    text: str,
+    external_channel: str | None = None,
+) -> str:
+    """Versão síncrona para scripts."""
+    import asyncio
+
+    return asyncio.run(
+        handle_inbound_text(
+            external_user_id=external_user_id,
+            text=text,
+            external_channel=external_channel,
+        )
+    )
+
+
+def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """Transcreve áudio usando Gemini para alimentar o fluxo textual."""
+    client = genai.Client()
+    response = client.models.generate_content(
+        model=settings.audio_transcribe_model,
+        contents=[
+            TRANSCRIBE_PROMPT,
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def _decode_b64_audio(raw_b64: str) -> bytes:
+    payload = raw_b64.strip()
+    if "," in payload and payload.lower().startswith("data:"):
+        payload = payload.split(",", 1)[1]
+    return base64.b64decode(payload)
+
+
+def fetch_audio_bytes_from_url(url: str) -> bytes:
+    with request.urlopen(url, timeout=settings.audio_fetch_timeout_seconds) as resp:
+        return resp.read()
+
+
+def _normalize_phone_from_remote_jid(remote_jid: str) -> str:
+    base = remote_jid.split("@", 1)[0].strip()
+    digits = re.sub(r"\D+", "", base)
+    if digits.startswith("55") and len(digits) > 10:
+        digits = digits[2:]
+    return digits
+
+
+def _extract_prename(data: dict[str, Any], body: dict[str, Any]) -> str:
+    candidate = (
+        data.get("pushName")
+        or data.get("senderName")
+        or body.get("pushName")
+        or body.get("senderName")
+        or ""
+    )
+    return str(candidate).strip()
+
+
+def _looks_like_address(text: str) -> bool:
+    t = (text or "").lower()
+    if len(t) < 12:
+        return False
+    tokens = ("rua", "avenida", "av ", "quadra", "bairro", "conjunto", "casa", "numero", "nº")
+    has_token = any(tok in t for tok in tokens)
+    has_digit = any(ch.isdigit() for ch in t)
+    return has_token and has_digit
+
+
+def _maybe_autosave_address(*, phone: str, text: str, external_channel: str) -> None:
+    if not _looks_like_address(text):
+        return
+    try:
+        lead_id = lead_repo.ensure_lead(external_channel, phone, touch_inbound=True)
+        lead = lead_repo.get_lead(lead_id) or {}
+        if not str(lead.get("address") or "").strip():
+            lead_repo.save_lead_field(lead_id, "address", text.strip())
+            lead_repo.append_message(lead_id, "tool", "autosave address from inbound text")
+    except Exception:
+        logger.exception("Falha ao autosalvar endereço para phone=%s", phone)
+
+
+def _extract_audio_payload(message: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(message.get("audioMessage"), dict):
+        return message["audioMessage"]
+    if isinstance(message.get("pttMessage"), dict):
+        return message["pttMessage"]
+    ephemeral = message.get("ephemeralMessage")
+    if isinstance(ephemeral, dict):
+        inner = ephemeral.get("message")
+        if isinstance(inner, dict):
+            if isinstance(inner.get("audioMessage"), dict):
+                return inner["audioMessage"]
+            if isinstance(inner.get("pttMessage"), dict):
+                return inner["pttMessage"]
+    view_once = message.get("viewOnceMessage")
+    if isinstance(view_once, dict):
+        inner = view_once.get("message")
+        if isinstance(inner, dict) and isinstance(inner.get("audioMessage"), dict):
+            return inner["audioMessage"]
+    return {}
+
+
+def _seed_lead_identity(*, phone: str, pre_name: str, external_channel: str) -> None:
+    try:
+        lead_id = lead_repo.ensure_lead(external_channel, phone, touch_inbound=True)
+        lead = lead_repo.get_lead(lead_id) or {}
+        if phone and (not lead.get("phone") or str(lead.get("phone")).strip() != phone):
+            lead_repo.save_lead_field(lead_id, "phone", phone)
+        if pre_name and not str(lead.get("display_name") or "").strip():
+            lead_repo.save_lead_field(lead_id, "display_name", pre_name)
+    except Exception:
+        logger.exception("Falha ao semear identidade do lead para phone=%s", phone)
+
+
+def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    Extrai metadados comuns de webhook inbound da Evolution API.
+
+    Compatível com estruturas comuns: `data.key.remoteJid`, `data.message.*`.
+    """
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    key = data.get("key") if isinstance(data, dict) else {}
+    message = data.get("message") if isinstance(data, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+
+    remote_jid = str(key.get("remoteJid") or data.get("remoteJid") or "").strip()
+    phone = _normalize_phone_from_remote_jid(remote_jid) if remote_jid else ""
+    pre_name = _extract_prename(data, body)
+    channel = "whatsapp"
+
+    text = ""
+    msg_type = str(data.get("messageType") or "")
+    if isinstance(message.get("conversation"), str):
+        text = message["conversation"].strip()
+    elif isinstance(message.get("extendedTextMessage"), dict):
+        text = str(message["extendedTextMessage"].get("text") or "").strip()
+    elif msg_type == "conversation":
+        text = str(data.get("text") or "").strip()
+
+    audio_payload = _extract_audio_payload(message)
+    audio_url = (
+        str(audio_payload.get("url") or data.get("mediaUrl") or body.get("mediaUrl") or "").strip()
+    )
+    audio_b64 = str(
+        audio_payload.get("base64")
+        or audio_payload.get("audioBase64")
+        or audio_payload.get("pttBase64")
+        or message.get("base64")
+        or message.get("audioBase64")
+        or data.get("base64")
+        or data.get("audioBase64")
+        or data.get("base64Audio")
+        or body.get("base64")
+        or body.get("audioBase64")
+        or body.get("base64Audio")
+        or ""
+    ).strip()
+    mime_type = str(audio_payload.get("mimetype") or data.get("mimetype") or "audio/ogg").strip()
+    has_audio = bool(audio_payload or audio_url or audio_b64)
+    if has_audio:
+        # Para mensagens com áudio, forçamos transcrição para evitar tratar
+        # placeholders do provedor como texto real do cliente.
+        text = ""
+
+    return {
+        "external_user_id": phone,
+        "raw_remote_jid": remote_jid,
+        "phone": phone,
+        "pre_name": pre_name,
+        "external_channel": channel,
+        "text": text,
+        "audio_url": audio_url,
+        "audio_b64": audio_b64,
+        "mime_type": mime_type,
+        "has_audio": has_audio,
+    }
+
+
+async def handle_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    Processa webhook inbound da Evolution API.
+    Retorna envelope pronto para camada HTTP responder.
+    """
+    parsed = parse_evolution_inbound(body)
+    phone = str(parsed.get("phone") or "").strip()
+    if not phone:
+        logger.warning("Webhook Evolution sem remoteJid válido: %s", parsed.get("raw_remote_jid"))
+        return build_http_response_envelope(
+            "Não consegui identificar seu número para continuar o atendimento. "
+            "Pode enviar uma nova mensagem?"
+        )
+    _seed_lead_identity(
+        phone=phone,
+        pre_name=str(parsed.get("pre_name") or "").strip(),
+        external_channel=str(parsed["external_channel"]),
+    )
+    _maybe_autosave_address(
+        phone=phone,
+        text=str(parsed.get("text") or ""),
+        external_channel=str(parsed["external_channel"]),
+    )
+    text = parsed["text"]
+    if not text:
+        try:
+            if parsed["audio_b64"]:
+                audio_bytes = _decode_b64_audio(parsed["audio_b64"])
+            elif parsed["audio_url"]:
+                audio_bytes = fetch_audio_bytes_from_url(parsed["audio_url"])
+            else:
+                audio_bytes = b""
+            if audio_bytes:
+                text = transcribe_audio_bytes(audio_bytes, parsed["mime_type"])
+        except Exception:
+            logger.exception("Falha ao transcrever áudio inbound da Evolution")
+            return build_http_response_envelope(
+                "Recebi seu áudio, mas não consegui transcrever agora. "
+                "Pode reenviar o áudio ou escrever em texto?"
+            )
+
+    if not text:
+        return build_http_response_envelope(
+            "Recebi sua mensagem. Pode me enviar em texto para eu te atender melhor?"
+        )
+
+    reply = await handle_inbound_text(
+        external_user_id=phone,
+        text=text,
+        external_channel=parsed["external_channel"],
+    )
+    return build_http_response_envelope(reply)
+
+
+def parse_meta_whatsapp_example(body: dict[str, Any]) -> tuple[str, str] | None:
+    """
+    Exemplo de extração para webhooks Meta Cloud API (ajuste ao payload real).
+
+    Retorna (wa_id, texto) ou None.
+    """
+    try:
+        entry = body["entry"][0]["changes"][0]["value"]
+        msg = entry["messages"][0]
+        if msg.get("type") != "text":
+            return None
+        wa_id = msg["from"]
+        text = msg["text"]["body"]
+        return wa_id, text
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def build_http_response_envelope(response_text: str) -> dict[str, Any]:
+    """Envelope genérico para o controlador HTTP devolver ao provedor."""
+    return {"reply": response_text, "correlation_id": str(uuid.uuid4())}
