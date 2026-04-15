@@ -12,8 +12,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 import requests
 
+# Sem override: em Docker, DATABASE_URL etc. vêm do Compose e não podem ser
+# substituídos pelo .env (ex.: 127.0.0.1:5433 quebraria a ligação a `postgres`).
 load_dotenv()
-load_dotenv(override=True)
 
 from sdr_ilha_ar.channel import handle_evolution_inbound, parse_evolution_inbound
 from sdr_ilha_ar.dashboard_api import router as dashboard_router
