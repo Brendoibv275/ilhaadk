@@ -1,34 +1,10 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: sdr
-      POSTGRES_PASSWORD: sdr
-      POSTGRES_DB: sdr
-    ports:
-      - "5433:5432"
-    volumes:
-      - sdr_pgdata:/var/lib/postgresql/data
-      # Primeira subida: Postgres aplica o schema. Volume já existente: ver README / comando psql manual.
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/10-ilha-schema.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sdr -d sdr"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
   api:
     build:
       context: .
       dockerfile: Dockerfile
     env_file:
       - .env
-    environment:
-      # Dentro do Compose o host da BD é o serviço `postgres`, não 127.0.0.1
-      DATABASE_URL: postgresql://sdr:sdr@postgres:5432/sdr
-    depends_on:
-      postgres:
-        condition: service_healthy
     ports:
       - "8000:8000"
     healthcheck:
@@ -49,6 +25,3 @@ services:
     # Host 3010 evita conflito com Easypanel (costuma usar :3000)
     ports:
       - "3010:3000"
-
-volumes:
-  sdr_pgdata:

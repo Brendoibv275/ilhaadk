@@ -17,7 +17,8 @@ Amostra alinhada ao plano **1 agente LLM robusto + Postgres + automações em wo
 
 - Python 3.10+
 - Conta/credenciais Google GenAI conforme ADK ([documentação ADK](https://google.github.io/adk-docs/))
-- Docker (opcional) para Postgres local
+- Projeto configurado no Supabase (PostgreSQL remoto) com URL de conexão
+- Docker (opcional) para rodar a API e o Dashboard localmente
 
 ## Setup rápido
 
@@ -36,8 +37,8 @@ cp .env.example .env
 # DB_CONNECT_RETRIES=2
 # DB_RETRY_BACKOFF_SECONDS=0.75
 
+# Certifique-se de executar o conteúdo de db/schema.sql no SQL Editor do Supabase primeiro!
 docker compose up -d
-psql "postgresql://sdr:sdr@127.0.0.1:5433/sdr" -f db/schema.sql
 
 python -m venv .venv
 .venv\Scripts\activate   # Windows
@@ -60,7 +61,7 @@ Se o banco estiver temporariamente indisponível, o agente devolve fallback amig
 Processe a fila a cada 1–5 minutos (um único processo por ambiente):
 
 ```bash
-set DATABASE_URL=postgresql://sdr:sdr@127.0.0.1:5433/sdr
+set DATABASE_URL="postgresql://postgres.xxx:xxx@...pooler.supabase.com:6543/postgres"
 python -m sdr_ilha_ar.workers tick
 # ou, após pip install -e .:
 sdr-workers tick
@@ -148,13 +149,12 @@ Abra `http://localhost:3000`.
 - `GET /api/dashboard/finance/entries`
 - `POST /api/dashboard/finance/entries`
 
-## Deploy local com Docker (front + back + banco)
+## Deploy local com Docker (front + back + Supabase)
 
-O `docker-compose.yml` agora sobe três serviços:
+O `docker-compose.yml` agora sobe dois serviços conectados ao seu banco remoto:
 
-- `postgres` (porta `5433` local -> `5432` container)
 - `api` FastAPI (porta `8000`)
-- `dashboard-web` Next.js (porta `3000`)
+- `dashboard-web` Next.js (porta `3010` mapeada para `3000`)
 
 ```bash
 cd python/agents/sdr-ilha-ar
