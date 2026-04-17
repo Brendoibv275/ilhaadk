@@ -88,6 +88,35 @@ def _split_text_blocks(text: str) -> list[str]:
     return chunks
 
 
+def _build_evolution_number_candidates(*, remote_jid: str, phone: str) -> list[str]:
+    """Gera candidatos aceitos pelo sendText da Evolution (com/sem DDI)."""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(value: str) -> None:
+        v = str(value or "").strip()
+        if not v or v in seen:
+            return
+        seen.add(v)
+        out.append(v)
+
+    jid_base = remote_jid.split("@", 1)[0].strip() if remote_jid else ""
+    phone_digits = re.sub(r"\D+", "", phone or "")
+    jid_digits = re.sub(r"\D+", "", jid_base)
+
+    if phone_digits:
+        _add(phone_digits)
+        if not phone_digits.startswith("55") and len(phone_digits) in {10, 11}:
+            _add(f"55{phone_digits}")
+    if jid_digits:
+        _add(jid_digits)
+        if not jid_digits.startswith("55") and len(jid_digits) in {10, 11}:
+            _add(f"55{jid_digits}")
+    if jid_base:
+        _add(jid_base)
+    return out
+
+
 def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str) -> None:
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
     api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
@@ -97,17 +126,16 @@ def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str) -> None:
         return
     endpoint = f"{base_url}/message/sendText/{instance}"
     headers = {"apikey": api_key, "Content-Type": "application/json"}
-    candidates: list[tuple[str, str]] = []
-    if phone:
-        candidates.append(("number", phone))
-    if remote_jid:
-        candidates.append(("number", remote_jid))
+    candidates = _build_evolution_number_candidates(remote_jid=remote_jid, phone=phone)
+    if not candidates:
+        logger.warning("Sem destinatário válido para Evolution (phone=%s remote_jid=%s)", phone, remote_jid)
+        return
     last_error: Exception | None = None
     chunks = _split_text_blocks(text) or [text]
     for chunk in chunks:
         sent = False
-        for field, value in candidates:
-            payload = {field: value, "text": chunk}
+        for value in candidates:
+            payload = {"number": value, "text": chunk}
             try:
                 response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
                 response.raise_for_status()
@@ -115,6 +143,13 @@ def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str) -> None:
                 break
             except Exception as exc:  # pragma: no cover - depende da API externa
                 last_error = exc
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    logger.warning(
+                        "Evolution rejeitou payload number=%s status=%s body=%s",
+                        value,
+                        exc.response.status_code,
+                        (exc.response.text or "").strip()[:400],
+                    )
         if not sent:
             break
         # Delay curto para envio natural em múltiplos blocos.
