@@ -12,16 +12,3 @@ services:
       interval: 15s
       timeout: 6s
       retries: 10
-
-  dashboard-web:
-    build:
-      context: ./dashboard-web
-      dockerfile: Dockerfile
-    environment:
-      BACKEND_INTERNAL_URL: http://api:8000
-    depends_on:
-      api:
-        condition: service_healthy
-    # Host 3010 evita conflito com Easypanel (costuma usar :3000)
-    ports:
-      - "3010:3000"
