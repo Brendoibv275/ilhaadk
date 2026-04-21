@@ -140,6 +140,44 @@ def _advance_lead_to_scheduled(lead_id: uuid.UUID) -> None:
             break
 
 
+def _crm_service_slug(st: str) -> str:
+    """Slug canônico de service_type para coluna leads.service_type."""
+    if st in ("limpeza", "higienizacao"):
+        return "higienizacao"
+    if st in ("visita_gratis", "defeito", "manutencao_corretiva"):
+        return "visita_tecnica_gratis"
+    return st
+
+
+def _finalize_ok_quote(
+    tool_context: ToolContext | None,
+    st: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Persiste service_type e quoted_amount após cotação ok (não bloqueia resposta ao cliente)."""
+    if result.get("status") != "ok":
+        return result
+    if tool_context is None:
+        return result
+    try:
+        lead_id = _resolve_lead_id(tool_context)
+        slug = _crm_service_slug(st)
+        amt = result.get("amount_brl")
+        lead_repo.save_lead_field(lead_id, "service_type", slug)
+        if amt is not None:
+            lead_repo.save_lead_field(lead_id, "quoted_amount", str(amt))
+        lead_repo.append_message(
+            lead_id,
+            "tool",
+            f"get_pricing_quote CRM service_type={slug!r} quoted_amount={amt!r}",
+        )
+    except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
+        logger.warning("CRM persist após get_pricing_quote falhou (DB): %s", e)
+    except (ValueError, LookupError) as e:
+        logger.warning("CRM persist após get_pricing_quote falhou: %s", e)
+    return result
+
+
 def get_pricing_quote(
     service_type: str,
     btus: int | None = None,
@@ -150,6 +188,7 @@ def get_pricing_quote(
     easy_access: str | None = None,
     floor_level: int | None = None,
     tubing_complex: str | None = None,
+    tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """
     Tabela Ilha Ar — **Somente São Luís** (valores oficiais do negócio).
@@ -169,6 +208,8 @@ def get_pricing_quote(
     Returns:
         amount_brl estimativa principal (mão de obra + material quando couber);
         scaffold_rental_client_brl separado (cliente paga direto ao fornecedor).
+
+    Quando `tool_context` é fornecido pelo ADK, grava `service_type` e `quoted_amount` no lead.
     """
     raw = service_type.lower().strip()
     if "preventiva" in raw.replace(" ", ""):
@@ -179,53 +220,69 @@ def get_pricing_quote(
         st = raw.replace(" ", "_").replace("ção", "cao")
     # aliases
     if st in ("limpeza", "higienizacao"):
-        return {
-            "status": "ok",
-            "currency": "BRL",
-            "amount_brl": 150.0,
-            "labor_brl": 150.0,
-            "materials_tubing_brl": 0.0,
-            "scaffold_rental_client_brl": None,
-            "summary": (
-                "Higienização completa: R$ 150,00. Limpeza profunda interna "
-                "(sujeira, mofo, bactérias). Válido em São Luís."
-            ),
-        }
+        return _finalize_ok_quote(
+            tool_context,
+            st,
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 150.0,
+                "labor_brl": 150.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Higienização completa: R$ 150,00. Limpeza profunda interna "
+                    "(sujeira, mofo, bactérias). Válido em São Luís."
+                ),
+            },
+        )
     if st in ("manutencao_preventiva", "manutenção preventiva", "preventiva"):
-        return {
-            "status": "ok",
-            "currency": "BRL",
-            "amount_brl": 150.0,
-            "labor_brl": 150.0,
-            "materials_tubing_brl": 0.0,
-            "scaffold_rental_client_brl": None,
-            "summary": "Manutenção preventiva: a partir de R$ 150,00 (São Luís).",
-        }
+        return _finalize_ok_quote(
+            tool_context,
+            st,
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 150.0,
+                "labor_brl": 150.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": "Manutenção preventiva: a partir de R$ 150,00 (São Luís).",
+            },
+        )
     if st in ("carga_gas_revisao", "carga_gas", "gas", "recarga"):
-        return {
-            "status": "ok",
-            "currency": "BRL",
-            "amount_brl": 180.0,
-            "labor_brl": 180.0,
-            "materials_tubing_brl": 0.0,
-            "scaffold_rental_client_brl": None,
-            "summary": "Carga de gás + revisão: a partir de R$ 180,00 (São Luís).",
-        }
+        return _finalize_ok_quote(
+            tool_context,
+            st,
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 180.0,
+                "labor_brl": 180.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": "Carga de gás + revisão: a partir de R$ 180,00 (São Luís).",
+            },
+        )
 
     if st in ("visita_tecnica_gratis", "visita_gratis", "defeito", "manutencao_corretiva"):
-        return {
-            "status": "ok",
-            "currency": "BRL",
-            "amount_brl": 0.0,
-            "labor_brl": 0.0,
-            "materials_tubing_brl": 0.0,
-            "scaffold_rental_client_brl": None,
-            "summary": (
-                "Visita técnica presencial gratuita para avaliação (sem orçamento remoto "
-                "nesse caso). Indicado: cassete/piso-teto, quebra de teto/fiação, não gela/"
-                "vazamento, cliente não sabe explicar o problema. São Luís."
-            ),
-        }
+        return _finalize_ok_quote(
+            tool_context,
+            st,
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 0.0,
+                "labor_brl": 0.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Visita técnica presencial gratuita para avaliação (sem orçamento remoto "
+                    "nesse caso). Indicado: cassete/piso-teto, quebra de teto/fiação, não gela/"
+                    "vazamento, cliente não sabe explicar o problema. São Luís."
+                ),
+            },
+        )
 
     if st != "instalacao":
         return {
@@ -264,18 +321,22 @@ def get_pricing_quote(
 
     # Regra crítica: se envolver quebra de parede/teto ou fiação, não orçar remoto.
     if wall_or_wiring is True:
-        return {
-            "status": "ok",
-            "currency": "BRL",
-            "amount_brl": 0.0,
-            "labor_brl": 0.0,
-            "materials_tubing_brl": 0.0,
-            "scaffold_rental_client_brl": None,
-            "summary": (
-                "Nesse caso, precisamos de visita técnica presencial gratuita antes de "
-                "passar orçamento, pois há necessidade de quebra estrutural/fiação."
-            ),
-        }
+        return _finalize_ok_quote(
+            tool_context,
+            "instalacao",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 0.0,
+                "labor_brl": 0.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Nesse caso, precisamos de visita técnica presencial gratuita antes de "
+                    "passar orçamento, pois há necessidade de quebra estrutural/fiação."
+                ),
+            },
+        )
 
     own = _pt_sim(has_own_tubing)
     if own is None and tubing_complex:
@@ -348,15 +409,19 @@ def get_pricing_quote(
             "Acesso não descrito como fácil (térreo/sacada/varanda): confirmar detalhes no local."
         )
 
-    return {
-        "status": "ok",
-        "currency": "BRL",
-        "amount_brl": round(total, 2),
-        "labor_brl": round(labor, 2),
-        "materials_tubing_brl": round(tubing_extra, 2),
-        "scaffold_rental_client_brl": scaffold_client,
-        "summary": " ".join(parts) + " Referência: São Luís.",
-    }
+    return _finalize_ok_quote(
+        tool_context,
+        "instalacao",
+        {
+            "status": "ok",
+            "currency": "BRL",
+            "amount_brl": round(total, 2),
+            "labor_brl": round(labor, 2),
+            "materials_tubing_brl": round(tubing_extra, 2),
+            "scaffold_rental_client_brl": scaffold_client,
+            "summary": " ".join(parts) + " Referência: São Luís.",
+        },
+    )
 
 
 def save_lead_field(
