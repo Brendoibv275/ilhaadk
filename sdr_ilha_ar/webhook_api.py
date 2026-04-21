@@ -193,24 +193,63 @@ def _send_whatsapp_audio(*, remote_jid: str, phone: str, audio_bytes: bytes, tex
     mime = "audio/mpeg"
     b64_uri = f"data:{mime};base64,{b64_audio}"
     
-    endpoint = f"{base_url}/message/sendWhatsAppAudio/{instance}"
     headers = {"apikey": api_key, "Content-Type": "application/json"}
     candidates = _build_evolution_number_candidates(remote_jid=remote_jid, phone=phone)
     if not candidates:
+        logger.warning("Sem destinatário para envio de áudio (phone=%s remote_jid=%s)", phone, remote_jid)
         return
-    
+
+    endpoints = (
+        f"{base_url}/message/sendWhatsAppAudio/{instance}",
+        f"{base_url}/message/sendPtt/{instance}",
+    )
     sent = False
+    last_error: Exception | None = None
     for value in candidates:
-        # A API Evolution aceita base64 longo diretamente assim. encoding=True força ser PTT (audio gravado na hora)
-        payload = {"number": value, "audio": b64_uri, "delay": 2000, "encoding": True}
-        try:
-            requests.post(endpoint, headers=headers, json=payload, timeout=25).raise_for_status()
-            sent = True
+        raw_payload = {"number": value, "audio": b64_audio, "delay": 2000, "encoding": True}
+        data_uri_payload = {"number": value, "audio": b64_uri, "delay": 2000, "encoding": True}
+        for endpoint in endpoints:
+            for payload in (raw_payload, data_uri_payload):
+                try:
+                    response = requests.post(endpoint, headers=headers, json=payload, timeout=25)
+                    response.raise_for_status()
+                    logger.info(
+                        "Áudio enviado para number=%s endpoint=%s data_uri=%s",
+                        value,
+                        endpoint,
+                        payload is data_uri_payload,
+                    )
+                    sent = True
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                        logger.warning(
+                            "Falha envio áudio number=%s endpoint=%s status=%s body=%s",
+                            value,
+                            endpoint,
+                            exc.response.status_code,
+                            (exc.response.text or "").strip()[:500],
+                        )
+                    else:
+                        logger.warning(
+                            "Falha envio áudio number=%s endpoint=%s erro=%s",
+                            value,
+                            endpoint,
+                            exc,
+                        )
+            if sent:
+                break
+        if sent:
             break
-        except Exception:
-            pass
     if not sent:
-        # Falback se der erro
+        logger.error(
+            "Não foi possível enviar áudio via Evolution; aplicando fallback em texto. phone=%s remote_jid=%s erro=%s",
+            phone,
+            remote_jid,
+            last_error,
+        )
+        # Fallback: se a Evolution recusar áudio, ao menos garantimos resposta textual.
         _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=text_fallback)
 
 
