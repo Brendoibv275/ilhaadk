@@ -229,7 +229,8 @@ async def _process_pending(phone: str) -> None:
         candidate = str(result.get("reply") or "").strip()
         if candidate:
             reply_to_send = candidate
-            must_reply_audio = result.get("must_reply_audio", False)
+            # Se qualquer evento no lote veio por áudio, preserva resposta em áudio.
+            must_reply_audio = must_reply_audio or bool(result.get("must_reply_audio", False))
             
     if reply_to_send:
         if must_reply_audio:

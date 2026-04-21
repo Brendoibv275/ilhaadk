@@ -215,6 +215,50 @@ def _extract_audio_payload(message: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _coalesce_audio_media_url(*, data: dict[str, Any], body: dict[str, Any], audio_payload: dict[str, Any]) -> str:
+    candidates = (
+        audio_payload.get("url"),
+        audio_payload.get("mediaUrl"),
+        data.get("mediaUrl"),
+        data.get("mediaURL"),
+        data.get("url"),
+        body.get("mediaUrl"),
+        body.get("mediaURL"),
+        body.get("url"),
+    )
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _has_audio_by_shape(*, body: dict[str, Any], data: dict[str, Any], message: dict[str, Any], audio_payload: dict[str, Any]) -> bool:
+    if audio_payload:
+        return True
+    msg_type = str(data.get("messageType") or body.get("messageType") or "").strip().lower()
+    if any(token in msg_type for token in ("audio", "ptt", "voice")):
+        return True
+    media_type = str(data.get("mediaType") or body.get("mediaType") or "").strip().lower()
+    if media_type in {"audio", "ptt", "voice"}:
+        return True
+    mime_candidates = (
+        audio_payload.get("mimetype"),
+        data.get("mimetype"),
+        data.get("mimeType"),
+        body.get("mimetype"),
+        body.get("mimeType"),
+    )
+    for raw in mime_candidates:
+        if isinstance(raw, str) and raw.strip().lower().startswith("audio/"):
+            return True
+    if isinstance(message.get("documentMessage"), dict):
+        doc = message["documentMessage"]
+        mime = str(doc.get("mimetype") or doc.get("mimeType") or "").strip().lower()
+        if mime.startswith("audio/"):
+            return True
+    return False
+
+
 def _seed_lead_identity(*, phone: str, pre_name: str, external_channel: str) -> None:
     try:
         lead_id = lead_repo.ensure_lead(external_channel, phone, touch_inbound=True)
@@ -265,9 +309,7 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         text = str(data.get("text") or "").strip()
 
     audio_payload = _extract_audio_payload(message)
-    audio_url = (
-        str(audio_payload.get("url") or data.get("mediaUrl") or body.get("mediaUrl") or "").strip()
-    )
+    audio_url = _coalesce_audio_media_url(data=data, body=body, audio_payload=audio_payload)
     audio_b64 = str(
         audio_payload.get("base64")
         or audio_payload.get("audioBase64")
@@ -283,7 +325,12 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         or ""
     ).strip()
     mime_type = str(audio_payload.get("mimetype") or data.get("mimetype") or "audio/ogg").strip()
-    has_audio = bool(audio_payload or audio_url or audio_b64)
+    has_audio = bool(audio_url or audio_b64) or _has_audio_by_shape(
+        body=body,
+        data=data,
+        message=message,
+        audio_payload=audio_payload,
+    )
     if has_audio:
         # Para mensagens com áudio, forçamos transcrição para evitar tratar
         # placeholders do provedor como texto real do cliente.
