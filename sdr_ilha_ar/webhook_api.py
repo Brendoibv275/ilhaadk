@@ -87,7 +87,7 @@ def _split_text_blocks(text: str) -> list[str]:
 
 
 def _build_evolution_number_candidates(*, remote_jid: str, phone: str) -> list[str]:
-    """Gera candidatos aceitos pelo sendText da Evolution (com/sem DDI)."""
+    """Gera candidatos para envio priorizando o remote_jid do webhook."""
     seen: set[str] = set()
     out: list[str] = []
 
@@ -102,16 +102,18 @@ def _build_evolution_number_candidates(*, remote_jid: str, phone: str) -> list[s
     phone_digits = re.sub(r"\D+", "", phone or "")
     jid_digits = re.sub(r"\D+", "", jid_base)
 
-    if phone_digits:
-        _add(phone_digits)
-        if not phone_digits.startswith("55") and len(phone_digits) in {10, 11}:
-            _add(f"55{phone_digits}")
+    # Padrao: responder sempre com base no remote_jid vindo da Evolution.
+    # Mantemos "phone" apenas como ultimo fallback quando o jid vier vazio.
     if jid_digits:
         _add(jid_digits)
         if not jid_digits.startswith("55") and len(jid_digits) in {10, 11}:
             _add(f"55{jid_digits}")
     if jid_base:
         _add(jid_base)
+    if not out and phone_digits:
+        _add(phone_digits)
+        if not phone_digits.startswith("55") and len(phone_digits) in {10, 11}:
+            _add(f"55{phone_digits}")
     return out
 
 
@@ -245,12 +247,16 @@ def _enqueue_payload(*, payload: dict[str, Any], remote_jid: str, phone: str) ->
     key = data.get("key") if isinstance(data, dict) else {}
     message_id = str(key.get("id") or data.get("id") or "").strip()
 
-    pending = _pending_by_phone.get(phone)
+    conversation_key = (remote_jid or phone).strip()
+    if not conversation_key:
+        return
+
+    pending = _pending_by_phone.get(conversation_key)
     if pending is None:
         pending = PendingConversation(payloads=[payload], remote_jid=remote_jid, phone=phone)
         if message_id:
             pending.message_ids.add(message_id)
-        _pending_by_phone[phone] = pending
+        _pending_by_phone[conversation_key] = pending
     else:
         if message_id and message_id in pending.message_ids:
             return
@@ -261,7 +267,7 @@ def _enqueue_payload(*, payload: dict[str, Any], remote_jid: str, phone: str) ->
     pending.last_update = datetime.now(timezone.utc)
     if pending.task and not pending.task.done():
         pending.task.cancel()
-    pending.task = asyncio.create_task(_process_pending(phone))
+    pending.task = asyncio.create_task(_process_pending(conversation_key))
 
 
 @app.get("/health")
@@ -301,7 +307,7 @@ async def webhook_whatsapp(
     phone = str(parsed.get("phone") or "").strip()
     remote_jid = str(parsed.get("raw_remote_jid") or "").strip()
 
-    if phone:
+    if remote_jid or phone:
         _enqueue_payload(payload=payload, remote_jid=remote_jid, phone=phone)
         return {"status": "queued", "delivery": "queued", "debounce_seconds": DEBOUNCE_SECONDS}
     result = await handle_evolution_inbound(payload)
