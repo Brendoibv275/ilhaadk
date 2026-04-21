@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Envio de notificações internas (Telegram)."""
+"""Envio de notificações internas (WhatsApp Admin via Evolution)."""
 
 from __future__ import annotations
 
@@ -18,25 +18,33 @@ from sdr_ilha_ar.config import settings
 logger = logging.getLogger(__name__)
 
 
-def send_telegram_message(text: str) -> dict[str, Any]:
-    """POST sendMessage na API do Telegram. Sem token, apenas registra em log."""
-    token = settings.telegram_bot_token
-    chat_id = settings.telegram_chat_id
-    if not token or not chat_id:
+def send_admin_whatsapp_message(text: str) -> dict[str, Any]:
+    """Envia mensagem ao WhatsApp do admin usando a Evolution API configurada."""
+    admin_number = settings.admin_whatsapp_number
+    if not admin_number:
         logger.warning(
-            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID ausentes; notificação não enviada: %s",
+            "ADMIN_WHATSAPP_NUMBER ausente; notificação não enviada: %s",
             text[:500],
         )
-        return {"status": "skipped", "reason": "telegram_not_configured"}
+        return {"status": "skipped", "reason": "admin_number_not_configured"}
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    import os
+    base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
+    api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
+    instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
+
+    if not (base_url and api_key and instance):
+        logger.warning("Credenciais da Evolution indisponíveis para notificação de admin.")
+        return {"status": "skipped", "reason": "evolution_not_configured"}
+
+    url = f"{base_url}/message/sendText/{instance}"
     body = json.dumps(
-        {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        {"number": admin_number, "text": text}
     ).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"apikey": api_key, "Content-Type": "application/json"},
         method="POST",
     )
     try:
@@ -44,7 +52,7 @@ def send_telegram_message(text: str) -> dict[str, Any]:
             raw = resp.read().decode("utf-8")
             return {"status": "ok", "response": raw[:500]}
     except urllib.error.URLError as e:
-        logger.exception("Falha ao enviar Telegram")
+        logger.exception("Falha ao enviar notificação WhatsApp para admin")
         return {"status": "error", "message": str(e)}
 
 

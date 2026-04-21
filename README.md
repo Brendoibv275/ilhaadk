@@ -18,7 +18,7 @@ Amostra alinhada ao plano **1 agente LLM robusto + Postgres + automações em wo
 - Python 3.10+
 - Conta/credenciais Google GenAI conforme ADK ([documentação ADK](https://google.github.io/adk-docs/))
 - Projeto configurado no Supabase (PostgreSQL remoto) com URL de conexão
-- Docker (opcional) para rodar a API e o Dashboard localmente
+- Docker (opcional) para rodar a API localmente
 
 ## Setup rápido
 
@@ -116,45 +116,11 @@ Campos mínimos esperados no payload (com variações aceitas):
 6. Teste rápido de saúde:
    - `GET ${PUBLIC_WEBHOOK_URL}/health`
 
-## Dashboard Web (Next.js)
+## Deploy local com Docker (API + Supabase)
 
-O projeto inclui um painel visual em `dashboard-web/` para operação e financeiro.
-
-### Subir backend (FastAPI)
-
-```bash
-python -m uvicorn sdr_ilha_ar.webhook_api:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### Subir frontend (Next.js)
-
-```bash
-cd dashboard-web
-# Opcional: para dev local com backend fora do docker
-# set BACKEND_INTERNAL_URL=http://127.0.0.1:8000
-npm run dev
-```
-
-Abra `http://localhost:3000`.
-
-### Endpoints principais do dashboard
-
-- `GET /api/dashboard/overview`
-- `GET /api/dashboard/funnel`
-- `GET /api/dashboard/appointments`
-- `GET /api/dashboard/jobs`
-- `GET /api/dashboard/callbacks`
-- `GET /api/dashboard/messages`
-- `GET /api/dashboard/finance/summary`
-- `GET /api/dashboard/finance/entries`
-- `POST /api/dashboard/finance/entries`
-
-## Deploy local com Docker (front + back + Supabase)
-
-O `docker-compose.yml` agora sobe dois serviços conectados ao seu banco remoto:
+O `docker-compose.yml` sobe o serviço da API conectado ao seu banco remoto:
 
 - `api` FastAPI (porta `8000`)
-- `dashboard-web` Next.js (porta `3010` mapeada para `3000`)
 
 ```bash
 cd python/agents/sdr-ilha-ar
@@ -163,10 +129,7 @@ docker compose up --build -d
 
 URLs:
 
-- Dashboard: `http://localhost:3000`
 - API health: `http://localhost:8000/health`
-
-No modo Docker, o front usa proxy interno (`/api/dashboard/*`) e conversa com o backend via `BACKEND_INTERNAL_URL=http://api:8000`, sem depender de `NEXT_PUBLIC_API_BASE_URL` no browser.
 
 ## MVP fechado (escopo)
 

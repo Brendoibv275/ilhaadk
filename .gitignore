@@ -14,11 +14,6 @@ venv/
 dist/
 build/
 
-# Node (dashboard)
-dashboard-web/node_modules/
-dashboard-web/.next/
-dashboard-web/out/
-
 # Dados locais / sessão
 *.db
 sdr_ilha_ar/.adk/

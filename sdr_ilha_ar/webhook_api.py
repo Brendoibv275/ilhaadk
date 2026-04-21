@@ -14,11 +14,9 @@ import psycopg
 import requests
 
 from sdr_ilha_ar.channel import handle_evolution_inbound, parse_evolution_inbound
-from sdr_ilha_ar.dashboard_api import router as dashboard_router
 from sdr_ilha_ar import repository as repo
 
 app = FastAPI(title="SDR Ilha Ar Webhook API", version="1.0.0")
-app.include_router(dashboard_router)
 logger = logging.getLogger(__name__)
 DEBOUNCE_SECONDS = 12
 
@@ -157,10 +155,61 @@ def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str) -> None:
             import time
 
             time.sleep(0.5)
-    if len(chunks) > 0 and last_error is None:
-        return
     if last_error:
         raise RuntimeError(f"Falha ao enviar resposta para Evolution: {last_error}") from last_error
+
+
+def _generate_elevenlabs_audio(text: str) -> bytes | None:
+    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
+    if not (api_key and voice_id):
+        logger.warning("Credenciais ElevenLabs ausentes")
+        return None
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+    body = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+    }
+    try:
+        resp = requests.post(url, json=body, headers=headers, timeout=20)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        logger.exception("Falha ao gerar audio ElevenLabs")
+        return None
+
+def _send_whatsapp_audio(*, remote_jid: str, phone: str, audio_bytes: bytes, text_fallback: str) -> None:
+    base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
+    api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
+    instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    if not (base_url and api_key and instance):
+        return
+    import base64
+    b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+    mime = "audio/mpeg"
+    b64_uri = f"data:{mime};base64,{b64_audio}"
+    
+    endpoint = f"{base_url}/message/sendWhatsAppAudio/{instance}"
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+    candidates = _build_evolution_number_candidates(remote_jid=remote_jid, phone=phone)
+    if not candidates:
+        return
+    
+    sent = False
+    for value in candidates:
+        # A API Evolution aceita base64 longo diretamente assim. encoding=True força ser PTT (audio gravado na hora)
+        payload = {"number": value, "audio": b64_uri, "delay": 2000, "encoding": True}
+        try:
+            requests.post(endpoint, headers=headers, json=payload, timeout=25).raise_for_status()
+            sent = True
+            break
+        except Exception:
+            pass
+    if not sent:
+        # Falback se der erro
+        _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=text_fallback)
 
 
 async def _process_pending(phone: str) -> None:
@@ -172,13 +221,23 @@ async def _process_pending(phone: str) -> None:
     remote_jid = pending.remote_jid
     _pending_by_phone.pop(phone, None)
     reply_to_send = ""
+    must_reply_audio = False
     for payload in payloads:
         result = await handle_evolution_inbound(payload)
         candidate = str(result.get("reply") or "").strip()
         if candidate:
             reply_to_send = candidate
+            must_reply_audio = result.get("must_reply_audio", False)
+            
     if reply_to_send:
-        _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
+        if must_reply_audio:
+            audio_data = await asyncio.to_thread(_generate_elevenlabs_audio, reply_to_send)
+            if audio_data:
+                _send_whatsapp_audio(remote_jid=remote_jid, phone=phone, audio_bytes=audio_data, text_fallback=reply_to_send)
+            else:
+                _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
+        else:
+            _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
 
 
 def _enqueue_payload(*, payload: dict[str, Any], remote_jid: str, phone: str) -> None:

@@ -14,7 +14,7 @@ from typing import Any
 
 from sdr_ilha_ar import repository as lead_repo
 from sdr_ilha_ar.config import settings
-from sdr_ilha_ar.notify import format_lead_notification, send_telegram_message
+from sdr_ilha_ar.notify import format_lead_notification, send_admin_whatsapp_message
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def _process_notify_internal(job: dict[str, Any]) -> None:
         lead or {},
         extra=extra,
     )
-    result = send_telegram_message(text)
+    result = send_admin_whatsapp_message(text)
     logger.info("notify_internal job=%s result=%s", job["id"], result)
 
 
@@ -105,6 +105,27 @@ def _process_check_calendar(job: dict[str, Any]) -> None:
     )
 
 
+def _process_abandonment_check(job: dict[str, Any]) -> None:
+    lead_id = uuid.UUID(str(job["lead_id"]))
+    lead = lead_repo.get_lead(lead_id)
+    if not lead:
+        return
+    stage = lead.get("stage")
+    if stage in {"new", "qualified"}:
+        name = lead.get("display_name") or "Cliente"
+        msg = (
+            f"Olá {name}, tudo bem? Sou eu, Kauan da Ilha Ar de novo! "
+            f"Vi que não concluímos nosso atendimento. Ficou alguma dúvida sobre nossos serviços "
+            f"ou gostaria de retomar o orçamento onde paramos?"
+        )
+        logger.info("[abandonment_check] lead=%s retentando contato", lead_id)
+        lead_repo.append_message(lead_id, "assistant_outbound_stub", msg)
+        
+        # Opcionalmente re-enfilera para tentar novamente
+        # lead_repo.enqueue_job(lead_id, "abandonment_check2", ...)
+    else:
+        logger.info("[abandonment_check] lead=%s evoluiu de estagio, ignorado.", lead_id)
+
 def process_job(job: dict[str, Any]) -> None:
     jid = uuid.UUID(str(job["id"]))
     jtype = job["job_type"]
@@ -117,6 +138,8 @@ def process_job(job: dict[str, Any]) -> None:
             _process_nps(job)
         elif jtype == "check_calendar":
             _process_check_calendar(job)
+        elif jtype == "abandonment_check":
+            _process_abandonment_check(job)
         else:
             raise ValueError(f"job_type desconhecido: {jtype}")
         lead_repo.complete_job(jid)

@@ -55,6 +55,7 @@ Peça os dados necessários **antes** de chamar `get_pricing_quote` para instala
 - BTUs (9k–12k no pacote base; **acima de 18k** regra de a partir de R$ 300).
 - Acesso fácil (térreo, sacada, varanda) ou não.
 - Pergunte explicitamente se precisa quebrar parede/teto ou fazer fiação elétrica e só chame `get_pricing_quote` depois dessa resposta.
+- **Importante sobre Funil**: Quando o lead fornecer dados relevantes do endereço ou equipamento, antes do fechamento, chame obrigatoriamente a tool `set_lead_stage` com o valor `qualified` para informar ao nosso funil que a qualificação iniciou.
 - Se **já tem tubulação**: R$ 250 é **só mão de obra**. Se **não tem**, material (~2 m) **~R$ 200** → total típico **~R$ 450** (serviço + material).
 - **Andaime / escada alta por fora:** mão de obra **a partir de R$ 300**. Aluguel do andaime o **cliente paga à parte**: 1º andar **R$ 130**, 2º **R$ 140**, 3º **R$ 160** (repasse o valor que a tool devolver em `scaffold_rental_client_brl`).
 

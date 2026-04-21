@@ -26,6 +26,9 @@ class Settings:
     default_external_channel: str
     telegram_bot_token: str | None
     telegram_chat_id: str | None
+    admin_whatsapp_number: str | None
+    elevenlabs_api_key: str | None
+    elevenlabs_voice_id: str | None
     google_review_url: str | None
     db_connect_timeout_seconds: int
     db_connect_retries: int
@@ -43,6 +46,9 @@ class Settings:
             ),
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID"),
+            admin_whatsapp_number=os.environ.get("ADMIN_WHATSAPP_NUMBER"),
+            elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY"),
+            elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID"),
             google_review_url=os.environ.get("GOOGLE_REVIEW_URL"),
             db_connect_timeout_seconds=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "5")),
             db_connect_retries=int(os.environ.get("DB_CONNECT_RETRIES", "2")),

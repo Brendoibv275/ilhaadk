@@ -223,6 +223,17 @@ def _seed_lead_identity(*, phone: str, pre_name: str, external_channel: str) -> 
             lead_repo.save_lead_field(lead_id, "phone", phone)
         if pre_name and not str(lead.get("display_name") or "").strip():
             lead_repo.save_lead_field(lead_id, "display_name", pre_name)
+            
+        # Agenda um Oi Sumido (Abandono) caso o lead empaque em "new"
+        from datetime import datetime, timedelta, timezone
+        run_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        lead_repo.enqueue_job(
+            lead_id,
+            "abandonment_check",
+            run_at,
+            {},
+            f"abandon_check_{lead_id}",
+        )
     except Exception:
         logger.exception("Falha ao semear identidade do lead para phone=%s", phone)
 
@@ -343,7 +354,9 @@ async def handle_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         text=text,
         external_channel=parsed["external_channel"],
     )
-    return build_http_response_envelope(reply)
+    envelope = build_http_response_envelope(reply)
+    envelope["must_reply_audio"] = parsed.get("has_audio", False)
+    return envelope
 
 
 def parse_meta_whatsapp_example(body: dict[str, Any]) -> tuple[str, str] | None:

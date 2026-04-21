@@ -466,6 +466,18 @@ def mark_quote_sent(tool_context: ToolContext) -> dict[str, Any]:
     """Registra envio de orçamento e agenda follow-up em 4 horas (idempotente por lead)."""
     try:
         lead_id = _resolve_lead_id(tool_context)
+        
+        # Tenta avançar o lead para quoted
+        row = lead_repo.get_lead(lead_id)
+        current = str(row.get("stage") or "new") if row else "new"
+        if current in {"new", "qualified"}:
+            try:
+                # Se for new, a máquina de estados (em state_machine.py) exige ir pra qualified e depois quoted,
+                # ou ela permite new -> quoted nativamente (VALID_TRANSITIONS["new"] tem "quoted").
+                lead_repo.set_lead_stage(lead_id, "quoted")
+            except ValueError:
+                pass
+
         lead_repo.mark_quote_sent(lead_id)
         run_at = datetime.now(timezone.utc) + timedelta(hours=4)
         lead_repo.enqueue_job(
@@ -529,8 +541,14 @@ def register_appointment_request(
                 ),
             }
         lead_repo.create_appointment(lead_id, final_window, status="proposed")
-        # Mantém o funil coerente após pedido confirmado.
-        _advance_lead_to_scheduled(lead_id)
+        # Mantém o funil coerente após pedido (vai pro awaiting_slot aguardando a equipe).
+        current_st = row.get("stage", "new")
+        if current_st in {"new", "qualified", "quoted"}:
+            try:
+                lead_repo.set_lead_stage(lead_id, "awaiting_slot")
+            except ValueError:
+                pass
+        
         # Se já agendou, follow-up de orçamento deixa de fazer sentido.
         lead_repo.cancel_pending_jobs_for_lead(lead_id, job_type="send_followup")
         now = datetime.now(timezone.utc)
