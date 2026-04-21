@@ -527,11 +527,28 @@ def request_human_handoff(reason: str, tool_context: ToolContext) -> dict[str, A
         return _db_error(e)
 
 
-def mark_quote_sent(tool_context: ToolContext) -> dict[str, Any]:
-    """Registra envio de orçamento e agenda follow-up em 4 horas (idempotente por lead)."""
+def mark_quote_sent(
+    tool_context: ToolContext,
+    client_facing_total_brl: str | None = None,
+) -> dict[str, Any]:
+    """
+    Registra envio de orçamento e agenda follow-up em 4 horas (idempotente por lead).
+
+    Use `client_facing_total_brl` com o valor **exato** (total Ilha Ar: mão de obra + material)
+    que você acabou de comunicar ao cliente, para o CRM ficar igual ao discurso.
+    Ex.: \"450\", \"450.00\".
+    """
     try:
         lead_id = _resolve_lead_id(tool_context)
-        
+        total = (client_facing_total_brl or "").strip()
+        if total:
+            lead_repo.save_lead_field(lead_id, "quoted_amount", total)
+            lead_repo.append_message(
+                lead_id,
+                "tool",
+                f"mark_quote_sent sync quoted_amount={total!r} (valor comunicado ao cliente)",
+            )
+
         # Tenta avançar o lead para quoted
         row = lead_repo.get_lead(lead_id)
         current = str(row.get("stage") or "new") if row else "new"
@@ -553,7 +570,11 @@ def mark_quote_sent(tool_context: ToolContext) -> dict[str, Any]:
             f"followup_quote_{lead_id}",
         )
         lead_repo.append_message(lead_id, "tool", "mark_quote_sent + followup 4h")
-        return {"status": "ok", "followup_scheduled_at": run_at.isoformat()}
+        return {
+            "status": "ok",
+            "followup_scheduled_at": run_at.isoformat(),
+            "quoted_amount_synced": total or None,
+        }
     except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
         return _db_error(e)
     except LookupError as e:
