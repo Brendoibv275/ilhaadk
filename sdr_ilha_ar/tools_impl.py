@@ -483,6 +483,20 @@ def set_lead_stage(target_stage: str, tool_context: ToolContext) -> dict[str, An
         lead_repo.append_message(lead_id, "tool", f"set_lead_stage -> {target_stage}")
         if row.get("stage") == "qualified":
             _label_lead_chat(lead_id, "novo_lead")
+        if row.get("stage") == "completed" and settings.six_month_followup_enabled:
+            run_at = datetime.now(timezone.utc) + timedelta(days=max(1, settings.six_month_followup_days))
+            lead_repo.enqueue_job(
+                lead_id=lead_id,
+                job_type="six_month_cleaning_followup",
+                run_at=run_at,
+                payload={"trigger": "lead_completed", "days": settings.six_month_followup_days},
+                idempotency_key=f"six_month_followup_{lead_id}_{run_at.date().isoformat()}",
+            )
+            lead_repo.append_message(
+                lead_id,
+                "tool",
+                f"six_month_cleaning_followup agendado para {run_at.isoformat()}",
+            )
         return {"status": "ok", "stage": row["stage"], "lead_id": str(lead_id)}
     except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
         return _db_error(e)

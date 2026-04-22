@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import uuid
 import re
 from urllib import request
@@ -47,6 +48,13 @@ def _runner_singleton() -> InMemoryRunner:
     if _runner is None:
         _runner = InMemoryRunner(agent=root_agent, app_name=settings.app_name)
     return _runner
+
+
+def _resolve_external_channel() -> str:
+    instance = str(os.getenv("EVOLUTION_INSTANCE") or "").strip().lower()
+    if instance:
+        return f"whatsapp:{instance}"
+    return "whatsapp"
 
 
 async def handle_inbound_text(
@@ -297,7 +305,7 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
     remote_jid = str(key.get("remoteJid") or data.get("remoteJid") or "").strip()
     phone = _normalize_phone_from_remote_jid(remote_jid) if remote_jid else ""
     pre_name = _extract_prename(data, body)
-    channel = "whatsapp"
+    channel = _resolve_external_channel()
 
     text = ""
     msg_type = str(data.get("messageType") or "")

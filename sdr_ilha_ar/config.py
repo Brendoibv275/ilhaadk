@@ -36,6 +36,13 @@ class Settings:
     db_retry_backoff_seconds: float
     audio_transcribe_model: str
     audio_fetch_timeout_seconds: int
+    human_handoff_finalize_patterns: str
+    human_handoff_allow_manual_resume: bool
+    human_handoff_manual_resume_commands: str
+    human_handoff_min_bot_outbound: int
+    human_handoff_min_stage: str
+    six_month_followup_enabled: bool
+    six_month_followup_days: int
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -59,6 +66,26 @@ class Settings:
                 "SDR_AUDIO_TRANSCRIBE_MODEL", "gemini-3.1-flash-lite-preview"
             ),
             audio_fetch_timeout_seconds=int(os.environ.get("AUDIO_FETCH_TIMEOUT_SECONDS", "15")),
+            human_handoff_finalize_patterns=os.environ.get(
+                "HUMAN_HANDOFF_FINALIZE_PATTERNS",
+                "obrigado,até a próxima,ate a proxima,finalizado,encerrado",
+            ),
+            human_handoff_allow_manual_resume=os.environ.get(
+                "HUMAN_HANDOFF_ALLOW_MANUAL_RESUME", "1"
+            ).strip().lower()
+            in {"1", "true", "yes", "sim"},
+            human_handoff_manual_resume_commands=os.environ.get(
+                "HUMAN_HANDOFF_MANUAL_RESUME_COMMANDS", "#retomarbot,#retomar,/retomar"
+            ),
+            human_handoff_min_bot_outbound=int(
+                os.environ.get("HUMAN_HANDOFF_MIN_BOT_OUTBOUND", "1")
+            ),
+            human_handoff_min_stage=os.environ.get("HUMAN_HANDOFF_MIN_STAGE", "qualified"),
+            six_month_followup_enabled=os.environ.get("SIX_MONTH_FOLLOWUP_ENABLED", "1")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "sim"},
+            six_month_followup_days=int(os.environ.get("SIX_MONTH_FOLLOWUP_DAYS", "180")),
         )
 
 

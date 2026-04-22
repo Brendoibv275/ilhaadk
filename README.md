@@ -67,6 +67,19 @@ python -m sdr_ilha_ar.workers tick
 sdr-workers tick
 ```
 
+Para execução contínua em produção com Docker Compose:
+
+```bash
+docker compose up -d worker
+docker compose logs -f worker
+```
+
+Checklist operacional recomendado:
+- Garanta apenas **1 worker ativo** por ambiente para evitar concorrência de processamento.
+- Monitore `automation_jobs` (pendentes/falhas) no banco diariamente.
+- Em falha recorrente, rode `python -m sdr_ilha_ar.workers tick` manualmente para inspeção.
+- Confirme no `.env` que `SIX_MONTH_FOLLOWUP_ENABLED=1` e `SIX_MONTH_FOLLOWUP_DAYS=180`.
+
 ### Notificação interna (MVP)
 
 Defina `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`. Jobs `notify_internal` enviam texto formatado (ex.: após `register_appointment_request` ou `request_human_handoff`).

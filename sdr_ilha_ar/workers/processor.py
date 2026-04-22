@@ -132,6 +132,27 @@ def _process_abandonment_check(job: dict[str, Any]) -> None:
     else:
         logger.info("[abandonment_check] lead=%s evoluiu de estagio, ignorado.", lead_id)
 
+
+def _process_six_month_cleaning_followup(job: dict[str, Any]) -> None:
+    lead_id = uuid.UUID(str(job["lead_id"]))
+    lead = lead_repo.get_lead(lead_id) or {}
+    name = lead.get("display_name") or "Cliente"
+    addr = lead.get("address") or "endereço não informado"
+    msg = (
+        "LEMBRETE PÓS-SERVIÇO (6 MESES)\n"
+        f"Cliente: {name}\n"
+        f"Endereço: {addr}\n"
+        "Ação: oferecer limpeza preventiva e revisão do ar-condicionado."
+    )
+    result = send_internal_notification_message(msg)
+    logger.info("six_month_cleaning_followup job=%s result=%s", job["id"], result)
+    lead_repo.append_message(
+        lead_id,
+        "tool",
+        "six_month_cleaning_followup enviado para equipe interna",
+        {"job_id": str(job["id"])},
+    )
+
 def process_job(job: dict[str, Any]) -> None:
     jid = uuid.UUID(str(job["id"]))
     jtype = job["job_type"]
@@ -146,6 +167,8 @@ def process_job(job: dict[str, Any]) -> None:
             _process_check_calendar(job)
         elif jtype == "abandonment_check":
             _process_abandonment_check(job)
+        elif jtype == "six_month_cleaning_followup":
+            _process_six_month_cleaning_followup(job)
         else:
             raise ValueError(f"job_type desconhecido: {jtype}")
         lead_repo.complete_job(jid)

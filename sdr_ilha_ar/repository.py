@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import shutil
 import subprocess
 import uuid
@@ -26,6 +27,7 @@ from sdr_ilha_ar.config import settings
 from sdr_ilha_ar import state_machine
 
 logger = logging.getLogger(__name__)
+HANDOFF_KEY = "_handoff"
 
 ALLOWED_LEAD_FIELDS = frozenset(
     {
@@ -182,6 +184,139 @@ def get_lead(lead_id: uuid.UUID) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM leads WHERE id = %s", (str(lead_id),))
             return cur.fetchone()
+
+
+def get_lead_by_external(external_channel: str, external_user_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM leads
+                WHERE external_channel = %s AND external_user_id = %s
+                """,
+                (external_channel, external_user_id),
+            )
+            return cur.fetchone()
+
+
+def _parse_quote_notes_meta(raw: Any) -> dict[str, Any]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return {}
+    try:
+        parsed = json.loads(txt)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {"_legacy_quote_notes": txt}
+
+
+def get_handoff_state(lead_id: uuid.UUID) -> dict[str, Any]:
+    lead = get_lead(lead_id) or {}
+    meta = _parse_quote_notes_meta(lead.get("quote_notes"))
+    handoff = meta.get(HANDOFF_KEY)
+    return handoff if isinstance(handoff, dict) else {}
+
+
+def set_handoff_state(
+    lead_id: uuid.UUID,
+    *,
+    active: bool,
+    activated_by: str = "human",
+    reason: str = "",
+) -> dict[str, Any]:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT quote_notes FROM leads WHERE id = %s FOR UPDATE",
+                (str(lead_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Lead não encontrado")
+            meta = _parse_quote_notes_meta(row.get("quote_notes"))
+            if active:
+                meta[HANDOFF_KEY] = {
+                    "active": True,
+                    "activated_at": datetime.now(timezone.utc).isoformat(),
+                    "activated_by": activated_by,
+                    "reason": reason,
+                }
+            else:
+                meta[HANDOFF_KEY] = {
+                    "active": False,
+                    "reactivated_at": datetime.now(timezone.utc).isoformat(),
+                    "reactivated_by": activated_by,
+                    "reason": reason,
+                }
+            cur.execute(
+                """
+                UPDATE leads
+                SET quote_notes = %s, updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (json.dumps(meta, ensure_ascii=False), str(lead_id)),
+            )
+            out = cur.fetchone()
+            if not out:
+                raise LookupError("Lead não encontrado")
+            return dict(out)
+
+
+def count_messages_by_roles(lead_id: uuid.UUID, roles: tuple[str, ...]) -> int:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)::int AS total
+                FROM messages
+                WHERE lead_id = %s AND role = ANY(%s)
+                """,
+                (str(lead_id), list(roles)),
+            )
+            row = cur.fetchone() or {}
+            return int(row.get("total") or 0)
+
+
+def confirm_latest_appointment_for_lead(lead_id: uuid.UUID) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE appointments
+                SET status = 'confirmed', updated_at = now()
+                WHERE id = (
+                    SELECT id FROM appointments
+                    WHERE lead_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
+                AND status = 'proposed'
+                RETURNING *
+                """,
+                (str(lead_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def promote_lead_stage_on_handoff(lead_id: uuid.UUID) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET stage = 'scheduled', updated_at = now()
+                WHERE id = %s
+                  AND stage IN ('awaiting_slot', 'quoted')
+                RETURNING *
+                """,
+                (str(lead_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def save_lead_field(lead_id: uuid.UUID, field_name: str, value: Any) -> dict[str, Any]:
