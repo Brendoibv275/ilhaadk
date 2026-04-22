@@ -40,6 +40,8 @@ class PendingConversation:
     payloads: list[dict[str, Any]]
     remote_jid: str
     phone: str
+    external_channel: str = "whatsapp"
+    evolution_instance: str = ""
     message_ids: set[str] = field(default_factory=set)
     last_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     task: asyncio.Task | None = None
@@ -49,11 +51,25 @@ _pending_by_phone: dict[str, PendingConversation] = {}
 _handoff_cache: dict[str, bool] = {}
 
 
-def _resolve_external_channel() -> str:
-    instance = str(os.getenv("EVOLUTION_INSTANCE") or "").strip().lower()
+def _resolve_external_channel(evolution_instance: str = "") -> str:
+    instance = str(evolution_instance or os.getenv("EVOLUTION_INSTANCE") or "").strip().lower()
     if instance:
         return f"whatsapp:{instance}"
     return "whatsapp"
+
+
+def _resolve_evolution_api_key(evolution_instance: str) -> str:
+    instance = str(evolution_instance or "").strip()
+    if instance:
+        upper = instance.upper()
+        env_direct = os.getenv(f"EVOLUTION_API_KEY_{upper}")
+        if env_direct:
+            return env_direct.strip()
+        if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip() == instance:
+            return str(os.getenv("EVOLUTION_API_KEY_A") or "").strip()
+        if str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip() == instance:
+            return str(os.getenv("EVOLUTION_API_KEY_B") or "").strip()
+    return str(os.getenv("EVOLUTION_API_KEY") or "").strip()
 
 
 def _truthy(v: Any) -> bool:
@@ -164,8 +180,8 @@ def _can_activate_handoff(lead_id: Any) -> bool:
     return _stage_rank(str(lead.get("stage") or "")) >= _stage_rank(min_stage)
 
 
-def _resolve_lead_id(phone: str) -> Any:
-    external_channel = _resolve_external_channel()
+def _resolve_lead_id(phone: str, evolution_instance: str = "") -> Any:
+    external_channel = _resolve_external_channel(evolution_instance)
     if not phone:
         return None
     lead = repo.get_lead_by_external(external_channel, phone)
@@ -184,8 +200,8 @@ def _sync_handoff_cache(conversation_key: str, lead_id: Any) -> bool:
     return active
 
 
-def _append_outbound_trace(phone: str, text: str, *, channel: str = "whatsapp") -> None:
-    lead_id = _resolve_lead_id(phone)
+def _append_outbound_trace(phone: str, text: str, *, channel: str = "whatsapp", evolution_instance: str = "") -> None:
+    lead_id = _resolve_lead_id(phone, evolution_instance=evolution_instance)
     if not lead_id:
         return
     try:
@@ -240,10 +256,10 @@ def _build_evolution_number_candidates(*, remote_jid: str, phone: str) -> list[s
     return out
 
 
-def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str) -> None:
+def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str, evolution_instance: str = "") -> None:
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
-    api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
-    instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    instance = str(evolution_instance or os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    api_key = _resolve_evolution_api_key(instance)
     if not (base_url and api_key and instance):
         logger.warning("Env da Evolution incompleta; resposta não enviada ao WhatsApp.")
         return
@@ -333,10 +349,17 @@ def _apply_maranhao_speech_style(text: str) -> str:
         out = re.sub(rf"\b{re.escape(src)}\b", dst, out, flags=re.IGNORECASE)
     return out
 
-def _send_whatsapp_audio(*, remote_jid: str, phone: str, audio_bytes: bytes, text_fallback: str) -> None:
+def _send_whatsapp_audio(
+    *,
+    remote_jid: str,
+    phone: str,
+    audio_bytes: bytes,
+    text_fallback: str,
+    evolution_instance: str = "",
+) -> None:
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
-    api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
-    instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    instance = str(evolution_instance or os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    api_key = _resolve_evolution_api_key(instance)
     if not (base_url and api_key and instance):
         return
     import base64
@@ -411,6 +434,8 @@ async def _process_pending(phone: str) -> None:
         return
     payloads = pending.payloads[:]
     remote_jid = pending.remote_jid
+    external_channel = pending.external_channel
+    evolution_instance = pending.evolution_instance
     _pending_by_phone.pop(phone, None)
     reply_to_send = ""
     must_reply_audio = False
@@ -426,31 +451,70 @@ async def _process_pending(phone: str) -> None:
         if must_reply_audio:
             # Exceção pedida: se a resposta tiver números relevantes, enviar texto para clareza.
             if _contains_critical_numbers(reply_to_send):
-                _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
+                _send_whatsapp_reply(
+                    remote_jid=remote_jid,
+                    phone=phone,
+                    text=reply_to_send,
+                    evolution_instance=evolution_instance,
+                )
             else:
                 tts_text = _apply_maranhao_speech_style(reply_to_send)
                 audio_data = await asyncio.to_thread(_generate_elevenlabs_audio, tts_text)
                 if audio_data:
-                    _send_whatsapp_audio(remote_jid=remote_jid, phone=phone, audio_bytes=audio_data, text_fallback=reply_to_send)
+                    _send_whatsapp_audio(
+                        remote_jid=remote_jid,
+                        phone=phone,
+                        audio_bytes=audio_data,
+                        text_fallback=reply_to_send,
+                        evolution_instance=evolution_instance,
+                    )
                 else:
-                    _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
+                    _send_whatsapp_reply(
+                        remote_jid=remote_jid,
+                        phone=phone,
+                        text=reply_to_send,
+                        evolution_instance=evolution_instance,
+                    )
         else:
-            _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
-        _append_outbound_trace(phone=phone, text=reply_to_send)
+            _send_whatsapp_reply(
+                remote_jid=remote_jid,
+                phone=phone,
+                text=reply_to_send,
+                evolution_instance=evolution_instance,
+            )
+        _append_outbound_trace(
+            phone=phone,
+            text=reply_to_send,
+            channel=external_channel,
+            evolution_instance=evolution_instance,
+        )
 
 
-def _enqueue_payload(*, payload: dict[str, Any], remote_jid: str, phone: str) -> None:
+def _enqueue_payload(
+    *,
+    payload: dict[str, Any],
+    remote_jid: str,
+    phone: str,
+    external_channel: str,
+    evolution_instance: str,
+) -> None:
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     key = data.get("key") if isinstance(data, dict) else {}
     message_id = str(key.get("id") or data.get("id") or "").strip()
 
-    conversation_key = (remote_jid or phone).strip()
+    conversation_key = f"{evolution_instance}|{(remote_jid or phone).strip()}"
     if not conversation_key:
         return
 
     pending = _pending_by_phone.get(conversation_key)
     if pending is None:
-        pending = PendingConversation(payloads=[payload], remote_jid=remote_jid, phone=phone)
+        pending = PendingConversation(
+            payloads=[payload],
+            remote_jid=remote_jid,
+            phone=phone,
+            external_channel=external_channel,
+            evolution_instance=evolution_instance,
+        )
         if message_id:
             pending.message_ids.add(message_id)
         _pending_by_phone[conversation_key] = pending
@@ -461,6 +525,8 @@ def _enqueue_payload(*, payload: dict[str, Any], remote_jid: str, phone: str) ->
             pending.message_ids.add(message_id)
         pending.payloads.append(payload)
     pending.remote_jid = remote_jid or pending.remote_jid
+    pending.external_channel = external_channel or pending.external_channel
+    pending.evolution_instance = evolution_instance or pending.evolution_instance
     pending.last_update = datetime.now(timezone.utc)
     if pending.task and not pending.task.done():
         pending.task.cancel()
@@ -493,7 +559,8 @@ async def webhook_whatsapp(
     payload = await request.json()
     parsed = parse_evolution_inbound(payload)
     logger.info(
-        "Inbound Evolution remote_jid=%s phone=%s has_audio=%s text_len=%s",
+        "Inbound Evolution instance=%s remote_jid=%s phone=%s has_audio=%s text_len=%s",
+        parsed.get("evolution_instance"),
         parsed.get("raw_remote_jid"),
         parsed.get("phone"),
         parsed.get("has_audio"),
@@ -501,8 +568,10 @@ async def webhook_whatsapp(
     )
     phone = str(parsed.get("phone") or "").strip()
     remote_jid = str(parsed.get("raw_remote_jid") or "").strip()
-    conversation_key = (remote_jid or phone).strip()
-    lead_id = _resolve_lead_id(phone) if phone else None
+    evolution_instance = str(parsed.get("evolution_instance") or "").strip()
+    external_channel = str(parsed.get("external_channel") or "").strip() or _resolve_external_channel(evolution_instance)
+    conversation_key = f"{evolution_instance}|{(remote_jid or phone).strip()}"
+    lead_id = _resolve_lead_id(phone, evolution_instance=evolution_instance) if phone else None
 
     if _is_from_me(payload):
         text = str(parsed.get("text") or "").strip()
@@ -545,7 +614,13 @@ async def webhook_whatsapp(
         return {"status": "ignored", "reason": "human_handoff_active"}
 
     if remote_jid or phone:
-        _enqueue_payload(payload=payload, remote_jid=remote_jid, phone=phone)
+        _enqueue_payload(
+            payload=payload,
+            remote_jid=remote_jid,
+            phone=phone,
+            external_channel=external_channel,
+            evolution_instance=evolution_instance,
+        )
         return {"status": "queued", "delivery": "queued", "debounce_seconds": DEBOUNCE_SECONDS}
     result = await handle_evolution_inbound(payload)
     return {**result, "delivery": "skipped"}

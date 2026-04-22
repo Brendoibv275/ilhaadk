@@ -19,18 +19,50 @@ from sdr_ilha_ar.config import settings
 logger = logging.getLogger(__name__)
 
 
-def _evolution_credentials() -> tuple[str, str, str] | None:
+def _instance_from_external_channel(external_channel: str | None) -> str:
+    raw = str(external_channel or "").strip().lower()
+    if raw.startswith("whatsapp:"):
+        return raw.split(":", 1)[1].strip()
+    return ""
+
+
+def _resolve_group_for_instance(instance: str) -> str:
+    import os
+    if instance:
+        if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip().lower() == instance:
+            return str(os.getenv("TECH_GROUP_JID_A") or "").strip()
+        if str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip().lower() == instance:
+            return str(os.getenv("TECH_GROUP_JID_B") or "").strip()
+        by_name = str(os.getenv(f"TECH_GROUP_JID_{instance.upper()}") or "").strip()
+        if by_name:
+            return by_name
+    return str(settings.tech_group_jid or "").strip()
+
+
+def _evolution_credentials(instance_hint: str = "") -> tuple[str, str, str] | None:
     import os
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
-    api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
-    instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    inst_hint = str(instance_hint or "").strip()
+    if inst_hint:
+        api_key = str(os.getenv(f"EVOLUTION_API_KEY_{inst_hint.upper()}") or "").strip()
+        if not api_key:
+            if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip() == inst_hint:
+                api_key = str(os.getenv("EVOLUTION_API_KEY_A") or "").strip()
+            elif str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip() == inst_hint:
+                api_key = str(os.getenv("EVOLUTION_API_KEY_B") or "").strip()
+        instance = inst_hint
+        if not api_key:
+            api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
+    else:
+        api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
+        instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
     if not (base_url and api_key and instance):
         return None
     return base_url, api_key, instance
 
 
-def _send_text_to_destination(number_or_jid: str, text: str) -> dict[str, Any]:
-    creds = _evolution_credentials()
+def _send_text_to_destination(number_or_jid: str, text: str, *, instance_hint: str = "") -> dict[str, Any]:
+    creds = _evolution_credentials(instance_hint=instance_hint)
     if not creds:
         logger.warning("Credenciais da Evolution indisponíveis para notificação interna.")
         return {"status": "skipped", "reason": "evolution_not_configured"}
@@ -55,7 +87,7 @@ def _send_text_to_destination(number_or_jid: str, text: str) -> dict[str, Any]:
         return {"status": "error", "message": str(e)}
 
 
-def send_admin_whatsapp_message(text: str) -> dict[str, Any]:
+def send_admin_whatsapp_message(text: str, *, instance_hint: str = "") -> dict[str, Any]:
     """Envia mensagem ao WhatsApp do admin usando a Evolution API configurada."""
     admin_number = settings.admin_whatsapp_number
     if not admin_number:
@@ -64,20 +96,21 @@ def send_admin_whatsapp_message(text: str) -> dict[str, Any]:
             text[:500],
         )
         return {"status": "skipped", "reason": "admin_number_not_configured"}
-    return _send_text_to_destination(admin_number, text)
+    return _send_text_to_destination(admin_number, text, instance_hint=instance_hint)
 
 
-def send_internal_notification_message(text: str) -> dict[str, Any]:
+def send_internal_notification_message(text: str, *, external_channel: str | None = None) -> dict[str, Any]:
     """
     Envia notificação para grupo técnico (quando configurado) e usa admin como fallback.
     """
-    group_jid = (settings.tech_group_jid or "").strip()
+    instance = _instance_from_external_channel(external_channel)
+    group_jid = _resolve_group_for_instance(instance)
     if group_jid:
-        result = _send_text_to_destination(group_jid, text)
+        result = _send_text_to_destination(group_jid, text, instance_hint=instance)
         if result.get("status") == "ok":
             return {"status": "ok", "destination": "tech_group", "result": result}
         logger.warning("Falha ao enviar para TECH_GROUP_JID; tentando ADMIN_WHATSAPP_NUMBER.")
-    admin_result = send_admin_whatsapp_message(text)
+    admin_result = send_admin_whatsapp_message(text, instance_hint=instance)
     return {"status": admin_result.get("status"), "destination": "admin_fallback", "result": admin_result}
 
 

@@ -50,8 +50,23 @@ def _runner_singleton() -> InMemoryRunner:
     return _runner
 
 
-def _resolve_external_channel() -> str:
-    instance = str(os.getenv("EVOLUTION_INSTANCE") or "").strip().lower()
+def _extract_evolution_instance(*, body: dict[str, Any], data: dict[str, Any]) -> str:
+    candidates = (
+        data.get("instance"),
+        data.get("instanceName"),
+        body.get("instance"),
+        body.get("instanceName"),
+        body.get("instance_name"),
+    )
+    for value in candidates:
+        txt = str(value or "").strip()
+        if txt:
+            return txt
+    return str(os.getenv("EVOLUTION_INSTANCE") or "").strip()
+
+
+def _resolve_external_channel(instance: str) -> str:
+    instance = str(instance or "").strip().lower()
     if instance:
         return f"whatsapp:{instance}"
     return "whatsapp"
@@ -305,7 +320,8 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
     remote_jid = str(key.get("remoteJid") or data.get("remoteJid") or "").strip()
     phone = _normalize_phone_from_remote_jid(remote_jid) if remote_jid else ""
     pre_name = _extract_prename(data, body)
-    channel = _resolve_external_channel()
+    evolution_instance = _extract_evolution_instance(body=body, data=data)
+    channel = _resolve_external_channel(evolution_instance)
 
     text = ""
     msg_type = str(data.get("messageType") or "")
@@ -350,6 +366,7 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         "phone": phone,
         "pre_name": pre_name,
         "external_channel": channel,
+        "evolution_instance": evolution_instance,
         "text": text,
         "audio_url": audio_url,
         "audio_b64": audio_b64,

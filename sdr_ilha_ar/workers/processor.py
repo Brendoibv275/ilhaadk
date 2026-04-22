@@ -50,7 +50,10 @@ def _process_notify_internal(job: dict[str, Any]) -> None:
         lead or {},
         extra=extra,
     )
-    result = send_internal_notification_message(text)
+    result = send_internal_notification_message(
+        text,
+        external_channel=(lead or {}).get("external_channel"),
+    )
     logger.info("notify_internal job=%s result=%s", job["id"], result)
 
 
@@ -144,7 +147,10 @@ def _process_six_month_cleaning_followup(job: dict[str, Any]) -> None:
         f"Endereço: {addr}\n"
         "Ação: oferecer limpeza preventiva e revisão do ar-condicionado."
     )
-    result = send_internal_notification_message(msg)
+    result = send_internal_notification_message(
+        msg,
+        external_channel=(lead or {}).get("external_channel"),
+    )
     logger.info("six_month_cleaning_followup job=%s result=%s", job["id"], result)
     lead_repo.append_message(
         lead_id,
