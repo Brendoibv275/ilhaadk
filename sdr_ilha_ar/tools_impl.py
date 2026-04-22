@@ -50,9 +50,18 @@ def _resolve_lead_id(tool_context: ToolContext) -> uuid.UUID:
     # ADK >= 1.30: ToolContext é alias de Context (sem .invocation_context público).
     external_user_id = tool_context.user_id
     channel = tool_context.state.get("external_channel") or settings.default_external_channel
+    lead_repo.reconcile_whatsapp_instance_channel(external_user_id, channel)
     lid = lead_repo.ensure_lead(channel, external_user_id, touch_inbound=True)
     tool_context.state["lead_id"] = str(lid)
     return lid
+
+
+def _external_channel_for_notify(tool_context: ToolContext, row: dict[str, Any]) -> str:
+    return str(
+        tool_context.state.get("external_channel")
+        or row.get("external_channel")
+        or ""
+    ).strip()
 
 
 def _db_error(e: Exception) -> dict[str, Any]:
@@ -562,11 +571,16 @@ def request_human_handoff(reason: str, tool_context: ToolContext) -> dict[str, A
                 # se transição direta falhar, ainda assim notifica
                 pass
         now = datetime.now(timezone.utc)
+        row_notify = lead_repo.get_lead(lead_id) or {}
         lead_repo.enqueue_job(
             lead_id,
             "notify_internal",
             now,
-            {"tag": "[EMERGÊNCIA]", "reason": reason},
+            {
+                "tag": "[EMERGÊNCIA]",
+                "reason": reason,
+                "external_channel": _external_channel_for_notify(tool_context, row_notify),
+            },
             f"handoff_{lead_id}_{int(now.timestamp())}",
         )
         lead_repo.insert_outbox_event(lead_id, "human_handoff", {"reason": reason})
@@ -699,6 +713,7 @@ def register_appointment_request(
                 "service_type": row.get("service_type") or "nao_informado",
                 "display_name": row.get("display_name") or "",
                 "address": row.get("address") or "",
+                "external_channel": _external_channel_for_notify(tool_context, row),
             },
             f"notify_appt_{lead_id}",
         )

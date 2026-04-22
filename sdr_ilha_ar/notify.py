@@ -28,12 +28,13 @@ def _instance_from_external_channel(external_channel: str | None) -> str:
 
 def _resolve_group_for_instance(instance: str) -> str:
     import os
-    if instance:
-        if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip().lower() == instance:
+    inst = str(instance or "").strip().lower()
+    if inst:
+        if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip().lower() == inst:
             return str(os.getenv("TECH_GROUP_JID_A") or "").strip()
-        if str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip().lower() == instance:
+        if str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip().lower() == inst:
             return str(os.getenv("TECH_GROUP_JID_B") or "").strip()
-        by_name = str(os.getenv(f"TECH_GROUP_JID_{instance.upper()}") or "").strip()
+        by_name = str(os.getenv(f"TECH_GROUP_JID_{inst.upper()}") or "").strip()
         if by_name:
             return by_name
     return str(settings.tech_group_jid or "").strip()
@@ -44,11 +45,12 @@ def _evolution_credentials(instance_hint: str = "") -> tuple[str, str, str] | No
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
     inst_hint = str(instance_hint or "").strip()
     if inst_hint:
+        il = inst_hint.lower()
         api_key = str(os.getenv(f"EVOLUTION_API_KEY_{inst_hint.upper()}") or "").strip()
         if not api_key:
-            if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip() == inst_hint:
+            if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip().lower() == il:
                 api_key = str(os.getenv("EVOLUTION_API_KEY_A") or "").strip()
-            elif str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip() == inst_hint:
+            elif str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip().lower() == il:
                 api_key = str(os.getenv("EVOLUTION_API_KEY_B") or "").strip()
         instance = inst_hint
         if not api_key:
@@ -105,11 +107,32 @@ def send_internal_notification_message(text: str, *, external_channel: str | Non
     """
     instance = _instance_from_external_channel(external_channel)
     group_jid = _resolve_group_for_instance(instance)
+    gj = group_jid or ""
+    logger.info(
+        "notify_internal route instance=%r group=%r external_channel=%r",
+        instance,
+        gj[:20] + "…" if len(gj) > 20 else gj,
+        external_channel,
+    )
     if group_jid:
         result = _send_text_to_destination(group_jid, text, instance_hint=instance)
         if result.get("status") == "ok":
             return {"status": "ok", "destination": "tech_group", "result": result}
-        logger.warning("Falha ao enviar para TECH_GROUP_JID; tentando ADMIN_WHATSAPP_NUMBER.")
+        logger.warning("Falha ao enviar para grupo interno; resultado=%s", result)
+        if not settings.internal_notify_admin_fallback:
+            return {"status": "error", "destination": "tech_group_failed", "result": result}
+    else:
+        logger.warning(
+            "Nenhum TECH_GROUP mapeado para instance=%r (external_channel=%r)",
+            instance,
+            external_channel,
+        )
+        if not settings.internal_notify_admin_fallback:
+            return {"status": "skipped", "reason": "no_group_for_instance"}
+    if not instance and (settings.tech_group_jid or "").strip():
+        logger.warning(
+            "external_channel sem instância (ex.: só 'whatsapp'); usando TECH_GROUP_JID fallback para admin"
+        )
     admin_result = send_admin_whatsapp_message(text, instance_hint=instance)
     return {"status": admin_result.get("status"), "destination": "admin_fallback", "result": admin_result}
 

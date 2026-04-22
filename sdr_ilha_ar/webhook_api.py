@@ -208,10 +208,11 @@ def _resolve_lead_id(phone: str, evolution_instance: str = "") -> Any:
     external_channel = _resolve_external_channel(evolution_instance)
     if not phone:
         return None
+    repo.reconcile_whatsapp_instance_channel(phone, external_channel)
     lead = repo.get_lead_by_external(external_channel, phone)
     if lead:
         return lead.get("id")
-    return repo.ensure_lead(external_channel=external_channel, external_user_id=phone)
+    return repo.ensure_lead(external_channel, phone)
 
 
 def _sync_handoff_cache(conversation_key: str, lead_id: Any) -> bool:

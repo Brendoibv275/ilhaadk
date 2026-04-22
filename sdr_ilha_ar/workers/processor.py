@@ -50,10 +50,8 @@ def _process_notify_internal(job: dict[str, Any]) -> None:
         lead or {},
         extra=extra,
     )
-    result = send_internal_notification_message(
-        text,
-        external_channel=(lead or {}).get("external_channel"),
-    )
+    ext_ch = payload.get("external_channel") or (lead or {}).get("external_channel")
+    result = send_internal_notification_message(text, external_channel=ext_ch)
     logger.info("notify_internal job=%s result=%s", job["id"], result)
 
 

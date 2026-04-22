@@ -51,17 +51,23 @@ def _runner_singleton() -> InMemoryRunner:
 
 
 def _extract_evolution_instance(*, body: dict[str, Any], data: dict[str, Any]) -> str:
-    candidates = (
-        data.get("instance"),
-        data.get("instanceName"),
-        body.get("instance"),
-        body.get("instanceName"),
-        body.get("instance_name"),
-    )
-    for value in candidates:
-        txt = str(value or "").strip()
-        if txt:
-            return txt
+    def _from_obj(obj: Any) -> str:
+        if isinstance(obj, str) and obj.strip():
+            return obj.strip()
+        if isinstance(obj, dict):
+            inner = obj.get("instanceName") or obj.get("name") or obj.get("instance")
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+        return ""
+
+    for obj in (body, data):
+        if not isinstance(obj, dict):
+            continue
+        for key in ("instance", "instanceName", "instance_name"):
+            hit = _from_obj(obj.get(key))
+            if hit:
+                return hit
+
     return str(os.getenv("EVOLUTION_INSTANCE") or "").strip()
 
 
@@ -107,7 +113,8 @@ async def handle_inbound_text(
         if created is not None:
             created.state["external_channel"] = channel
     else:
-        existing.state.setdefault("external_channel", channel)
+        # Sempre atualiza: sessões antigas podem ter ficado só em "whatsapp" e quebram roteamento A/B.
+        existing.state["external_channel"] = channel
 
     content = types.Content(role="user", parts=[types.Part(text=text)])
     final_text = ""
@@ -284,6 +291,7 @@ def _has_audio_by_shape(*, body: dict[str, Any], data: dict[str, Any], message: 
 
 def _seed_lead_identity(*, phone: str, pre_name: str, external_channel: str) -> None:
     try:
+        lead_repo.reconcile_whatsapp_instance_channel(phone, external_channel)
         lead_id = lead_repo.ensure_lead(external_channel, phone, touch_inbound=True)
         lead = lead_repo.get_lead(lead_id) or {}
         if phone and (not lead.get("phone") or str(lead.get("phone")).strip() != phone):

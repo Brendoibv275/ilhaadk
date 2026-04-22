@@ -152,6 +152,77 @@ def bootstrap_db_schema() -> None:
     logger.info("db/schema.sql aplicado (bootstrap)")
 
 
+def reconcile_whatsapp_instance_channel(
+    external_user_id: str,
+    namespaced_channel: str,
+) -> None:
+    """
+    Evita dois leads para o mesmo telefone (legado `whatsapp` vs `whatsapp:<instancia>`).
+    Quando existir o par, move filhas para o lead canônico e remove o duplicado.
+    """
+    ch = str(namespaced_channel or "").strip()
+    if not ch.startswith("whatsapp:"):
+        return
+    uid = str(external_user_id or "").strip()
+    if not uid:
+        return
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM leads
+                WHERE external_user_id = %s AND external_channel = %s
+                """,
+                (uid, ch),
+            )
+            canon = cur.fetchone()
+            cur.execute(
+                """
+                SELECT id FROM leads
+                WHERE external_user_id = %s AND external_channel = 'whatsapp'
+                """,
+                (uid,),
+            )
+            legacy = cur.fetchone()
+            if not legacy:
+                return
+            legacy_id = str(legacy["id"])
+            if canon:
+                canon_id = str(canon["id"])
+                if canon_id == legacy_id:
+                    return
+                cur.execute(
+                    "UPDATE messages SET lead_id = %s WHERE lead_id = %s",
+                    (canon_id, legacy_id),
+                )
+                cur.execute(
+                    "UPDATE appointments SET lead_id = %s WHERE lead_id = %s",
+                    (canon_id, legacy_id),
+                )
+                cur.execute(
+                    "UPDATE automation_jobs SET lead_id = %s WHERE lead_id = %s",
+                    (canon_id, legacy_id),
+                )
+                cur.execute(
+                    "UPDATE outbox_events SET lead_id = %s WHERE lead_id = %s",
+                    (canon_id, legacy_id),
+                )
+                cur.execute(
+                    "UPDATE finance_entries SET lead_id = %s WHERE lead_id = %s",
+                    (canon_id, legacy_id),
+                )
+                cur.execute("DELETE FROM leads WHERE id = %s", (legacy_id,))
+            else:
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET external_channel = %s, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (ch, legacy_id),
+                )
+
+
 def ensure_lead(
     external_channel: str,
     external_user_id: str,

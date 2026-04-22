@@ -43,6 +43,7 @@ class Settings:
     human_handoff_min_stage: str
     six_month_followup_enabled: bool
     six_month_followup_days: int
+    internal_notify_admin_fallback: bool
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -86,6 +87,10 @@ class Settings:
             .lower()
             in {"1", "true", "yes", "sim"},
             six_month_followup_days=int(os.environ.get("SIX_MONTH_FOLLOWUP_DAYS", "180")),
+            internal_notify_admin_fallback=os.environ.get("INTERNAL_NOTIFY_ADMIN_FALLBACK", "1")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "sim"},
         )
 
 
