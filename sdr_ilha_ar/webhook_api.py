@@ -80,6 +80,30 @@ def _truthy(v: Any) -> bool:
     return bool(v)
 
 
+def _normalize_phone_digits(value: str) -> str:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if digits.startswith("55") and len(digits) > 10:
+        digits = digits[2:]
+    return digits
+
+
+def _ignored_inbound_numbers() -> set[str]:
+    raw = str(os.getenv("IGNORED_WHATSAPP_NUMBERS") or "").strip()
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for part in raw.split(","):
+        norm = _normalize_phone_digits(part.strip())
+        if norm:
+            out.add(norm)
+    return out
+
+
+def _is_ignored_inbound_phone(phone: str) -> bool:
+    norm = _normalize_phone_digits(phone)
+    return bool(norm) and norm in _ignored_inbound_numbers()
+
+
 def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
     return payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
@@ -609,6 +633,10 @@ async def webhook_whatsapp(
             _activate_handoff_pause(conversation_key)
             return {"status": "ok", "reason": "human_handoff_activated"}
         return {"status": "ignored", "reason": "outbound_without_recipient"}
+
+    if _is_ignored_inbound_phone(phone):
+        logger.info("Inbound ignorado para phone bloqueado=%s", phone)
+        return {"status": "ignored", "reason": "ignored_inbound_phone"}
 
     if conversation_key and lead_id and (_is_handoff_paused(conversation_key) or _sync_handoff_cache(conversation_key, lead_id)):
         return {"status": "ignored", "reason": "human_handoff_active"}
