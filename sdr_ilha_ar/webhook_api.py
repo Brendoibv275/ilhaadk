@@ -182,6 +182,34 @@ def _generate_elevenlabs_audio(text: str) -> bytes | None:
         logger.exception("Falha ao gerar audio ElevenLabs")
         return None
 
+
+def _contains_critical_numbers(text: str) -> bool:
+    t = str(text or "")
+    if not t:
+        return False
+    return bool(re.search(r"\d", t))
+
+
+def _apply_maranhao_speech_style(text: str) -> str:
+    """
+    Ajuste leve de pronúncia para TTS, apenas no áudio.
+    Mantém legibilidade no texto normal.
+    """
+    if (os.getenv("TTS_MARANHAO_STYLE") or "1").strip().lower() in {"0", "false", "no", "off"}:
+        return text
+    out = str(text or "")
+    # Regras suaves e localizadas para não distorcer totalmente a mensagem.
+    replacements = {
+        "pista": "pixta",
+        "esteira": "exteira",
+        "suporte": "xuporte",
+        "serviço": "xerviço",
+        "servico": "xervico",
+    }
+    for src, dst in replacements.items():
+        out = re.sub(rf"\b{re.escape(src)}\b", dst, out, flags=re.IGNORECASE)
+    return out
+
 def _send_whatsapp_audio(*, remote_jid: str, phone: str, audio_bytes: bytes, text_fallback: str) -> None:
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
     api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
@@ -273,11 +301,16 @@ async def _process_pending(phone: str) -> None:
             
     if reply_to_send:
         if must_reply_audio:
-            audio_data = await asyncio.to_thread(_generate_elevenlabs_audio, reply_to_send)
-            if audio_data:
-                _send_whatsapp_audio(remote_jid=remote_jid, phone=phone, audio_bytes=audio_data, text_fallback=reply_to_send)
-            else:
+            # Exceção pedida: se a resposta tiver números relevantes, enviar texto para clareza.
+            if _contains_critical_numbers(reply_to_send):
                 _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
+            else:
+                tts_text = _apply_maranhao_speech_style(reply_to_send)
+                audio_data = await asyncio.to_thread(_generate_elevenlabs_audio, tts_text)
+                if audio_data:
+                    _send_whatsapp_audio(remote_jid=remote_jid, phone=phone, audio_bytes=audio_data, text_fallback=reply_to_send)
+                else:
+                    _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
         else:
             _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=reply_to_send)
 

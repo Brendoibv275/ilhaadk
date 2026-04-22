@@ -14,7 +14,7 @@ from typing import Any
 
 from sdr_ilha_ar import repository as lead_repo
 from sdr_ilha_ar.config import settings
-from sdr_ilha_ar.notify import format_lead_notification, send_admin_whatsapp_message
+from sdr_ilha_ar.notify import format_lead_notification, send_internal_notification_message
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,12 @@ def _process_notify_internal(job: dict[str, Any]) -> None:
     extra_lines = []
     if payload.get("reason"):
         extra_lines.append(f"Motivo: {payload['reason']}")
+    if payload.get("service_type"):
+        extra_lines.append(f"Solicitação: {payload['service_type']}")
+    if payload.get("display_name"):
+        extra_lines.append(f"Nome: {payload['display_name']}")
+    if payload.get("address"):
+        extra_lines.append(f"Endereço: {payload['address']}")
     if payload.get("window_label"):
         extra_lines.append(f"Janela pedida: {payload['window_label']}")
     if payload.get("notes"):
@@ -44,7 +50,7 @@ def _process_notify_internal(job: dict[str, Any]) -> None:
         lead or {},
         extra=extra,
     )
-    result = send_admin_whatsapp_message(text)
+    result = send_internal_notification_message(text)
     logger.info("notify_internal job=%s result=%s", job["id"], result)
 
 

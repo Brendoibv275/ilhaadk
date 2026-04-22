@@ -12,34 +12,33 @@ import logging
 import urllib.error
 import urllib.request
 from typing import Any
+import requests
 
 from sdr_ilha_ar.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-def send_admin_whatsapp_message(text: str) -> dict[str, Any]:
-    """Envia mensagem ao WhatsApp do admin usando a Evolution API configurada."""
-    admin_number = settings.admin_whatsapp_number
-    if not admin_number:
-        logger.warning(
-            "ADMIN_WHATSAPP_NUMBER ausente; notificação não enviada: %s",
-            text[:500],
-        )
-        return {"status": "skipped", "reason": "admin_number_not_configured"}
-
+def _evolution_credentials() -> tuple[str, str, str] | None:
     import os
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
     api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
     instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
-
     if not (base_url and api_key and instance):
-        logger.warning("Credenciais da Evolution indisponíveis para notificação de admin.")
+        return None
+    return base_url, api_key, instance
+
+
+def _send_text_to_destination(number_or_jid: str, text: str) -> dict[str, Any]:
+    creds = _evolution_credentials()
+    if not creds:
+        logger.warning("Credenciais da Evolution indisponíveis para notificação interna.")
         return {"status": "skipped", "reason": "evolution_not_configured"}
+    base_url, api_key, instance = creds
 
     url = f"{base_url}/message/sendText/{instance}"
     body = json.dumps(
-        {"number": admin_number, "text": text}
+        {"number": number_or_jid, "text": text}
     ).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -52,8 +51,71 @@ def send_admin_whatsapp_message(text: str) -> dict[str, Any]:
             raw = resp.read().decode("utf-8")
             return {"status": "ok", "response": raw[:500]}
     except urllib.error.URLError as e:
-        logger.exception("Falha ao enviar notificação WhatsApp para admin")
+        logger.exception("Falha ao enviar mensagem interna WhatsApp")
         return {"status": "error", "message": str(e)}
+
+
+def send_admin_whatsapp_message(text: str) -> dict[str, Any]:
+    """Envia mensagem ao WhatsApp do admin usando a Evolution API configurada."""
+    admin_number = settings.admin_whatsapp_number
+    if not admin_number:
+        logger.warning(
+            "ADMIN_WHATSAPP_NUMBER ausente; notificação não enviada: %s",
+            text[:500],
+        )
+        return {"status": "skipped", "reason": "admin_number_not_configured"}
+    return _send_text_to_destination(admin_number, text)
+
+
+def send_internal_notification_message(text: str) -> dict[str, Any]:
+    """
+    Envia notificação para grupo técnico (quando configurado) e usa admin como fallback.
+    """
+    group_jid = (settings.tech_group_jid or "").strip()
+    if group_jid:
+        result = _send_text_to_destination(group_jid, text)
+        if result.get("status") == "ok":
+            return {"status": "ok", "destination": "tech_group", "result": result}
+        logger.warning("Falha ao enviar para TECH_GROUP_JID; tentando ADMIN_WHATSAPP_NUMBER.")
+    admin_result = send_admin_whatsapp_message(text)
+    return {"status": admin_result.get("status"), "destination": "admin_fallback", "result": admin_result}
+
+
+def apply_whatsapp_label(*, remote_jid: str, label: str) -> dict[str, Any]:
+    """
+    Aplica etiqueta no chat via Evolution. Best effort: tenta endpoints/payloads comuns.
+    """
+    jid = str(remote_jid or "").strip()
+    if not jid:
+        return {"status": "skipped", "reason": "empty_remote_jid"}
+    creds = _evolution_credentials()
+    if not creds:
+        return {"status": "skipped", "reason": "evolution_not_configured"}
+    base_url, api_key, instance = creds
+    endpoints = (
+        f"{base_url}/chat/addLabel/{instance}",
+        f"{base_url}/chat/updateLabel/{instance}",
+        f"{base_url}/chat/markLabel/{instance}",
+    )
+    number = jid.split("@", 1)[0]
+    payloads = (
+        {"jid": jid, "label": label},
+        {"chatId": jid, "label": label},
+        {"number": number, "label": label},
+        {"remoteJid": jid, "label": label},
+    )
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+    last_error: Exception | None = None
+    for endpoint in endpoints:
+        for payload in payloads:
+            try:
+                response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+                response.raise_for_status()
+                return {"status": "ok", "endpoint": endpoint}
+            except Exception as exc:
+                last_error = exc
+    logger.warning("Falha ao aplicar etiqueta=%s no jid=%s erro=%s", label, jid, last_error)
+    return {"status": "error", "message": str(last_error) if last_error else "unknown"}
 
 
 def format_lead_notification(title: str, lead: dict[str, Any], extra: str = "") -> str:

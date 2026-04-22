@@ -27,6 +27,7 @@ class Settings:
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     admin_whatsapp_number: str | None
+    tech_group_jid: str | None
     elevenlabs_api_key: str | None
     elevenlabs_voice_id: str | None
     google_review_url: str | None
@@ -47,6 +48,7 @@ class Settings:
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID"),
             admin_whatsapp_number=os.environ.get("ADMIN_WHATSAPP_NUMBER"),
+            tech_group_jid=os.environ.get("TECH_GROUP_JID"),
             elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY"),
             elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID"),
             google_review_url=os.environ.get("GOOGLE_REVIEW_URL"),

@@ -20,6 +20,7 @@ from google.adk.tools import ToolContext
 from sdr_ilha_ar import repository as lead_repo
 from sdr_ilha_ar.config import settings
 from sdr_ilha_ar.repository import DatabaseNotConfiguredError, DatabaseUnavailableError
+from sdr_ilha_ar.notify import apply_whatsapp_label
 
 logger = logging.getLogger(__name__)
 BR_TZ = ZoneInfo("America/Fortaleza")
@@ -57,6 +58,22 @@ def _resolve_lead_id(tool_context: ToolContext) -> uuid.UUID:
 def _db_error(e: Exception) -> dict[str, Any]:
     logger.exception("Erro de persistência nas tools do SDR")
     return {"status": "error", "message": str(e)}
+
+
+def _label_lead_chat(lead_id: uuid.UUID, label: str) -> None:
+    """Best effort para etiquetar o chat no WhatsApp via Evolution."""
+    try:
+        lead = lead_repo.get_lead(lead_id) or {}
+        raw = str(lead.get("external_user_id") or "").strip()
+        if not raw:
+            return
+        digits = re.sub(r"\D+", "", raw)
+        if not digits:
+            return
+        remote_jid = f"{digits}@s.whatsapp.net"
+        apply_whatsapp_label(remote_jid=remote_jid, label=label)
+    except Exception:
+        logger.exception("Falha ao etiquetar chat do lead=%s label=%s", lead_id, label)
 
 
 def _pt_sim(val: str | None) -> bool | None:
@@ -311,13 +328,22 @@ def get_pricing_quote(
             wall_or_wiring = True
 
     if wall_or_wiring is None:
-        return {
-            "status": "needs_info",
-            "message": (
-                "Antes de passar orçamento remoto, confirme com o cliente se será "
-                "necessário quebrar parede/teto ou fazer fiação elétrica."
-            ),
-        }
+        return _finalize_ok_quote(
+            tool_context,
+            "visita_tecnica_gratis",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 0.0,
+                "labor_brl": 0.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Para evitar erro no diagnóstico, vamos de visita técnica gratuita. "
+                    "Assim avaliamos o local com segurança e te passamos o melhor cenário."
+                ),
+            },
+        )
 
     # Regra crítica: se envolver quebra de parede/teto ou fiação, não orçar remoto.
     if wall_or_wiring is True:
@@ -348,66 +374,73 @@ def get_pricing_quote(
             own = False
         elif any(x in tc for x in ("ja tenho", "já tenho", "tenho a tubo", "tenho tubo")):
             own = True
-    scaffold_rent_map = {1: 130.0, 2: 140.0, 3: 160.0}
     needs_scaf = _pt_sim(needs_scaffold_exterior)
     easy = _pt_sim(easy_access)
     if easy is None:
-        easy = True
+        return _finalize_ok_quote(
+            tool_context,
+            "visita_tecnica_gratis",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 0.0,
+                "labor_brl": 0.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Se o acesso ainda não está claro, seguimos com visita técnica gratuita. "
+                    "É o caminho mais seguro para fechar o orçamento sem erro."
+                ),
+            },
+        )
 
-    sf = scaffold_floor
-    if sf is None and floor_level is not None and 1 <= int(floor_level) <= 3:
-        sf = int(floor_level)
+    if needs_scaf is True or easy is False:
+        return _finalize_ok_quote(
+            tool_context,
+            "visita_tecnica_gratis",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 0.0,
+                "labor_brl": 0.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Para instalação com acesso complexo (altura/andaime/área externa), "
+                    "vamos de visita técnica gratuita para avaliar com segurança."
+                ),
+            },
+        )
 
-    labor = 250.0
-    if btus is not None and int(btus) > 18000:
-        labor = max(labor, 300.0)
-    if needs_scaf is True:
-        labor = max(labor, 300.0)
+    labor = 300.0
 
     tubing_extra = 0.0
     if own is False:
         tubing_extra = 200.0
 
     total = labor + tubing_extra
-    scaffold_client: float | None = None
-    if needs_scaf is True and sf in scaffold_rent_map:
-        scaffold_client = scaffold_rent_map[int(sf)]
-
-    labor_note = "acesso fácil (ex.: térreo, sacada, varanda) / 9k–12k BTUs no pacote base"
-    if labor > 250 or (btus is not None and int(btus) > 12000):
-        labor_note = "regras de dificuldade, andaime ou potência > 18k BTUs"
-    parts = [f"Mão de obra instalação: a partir de R$ {labor:.0f} ({labor_note})."]
+    labor_note = "instalação padrão com acesso fácil (térreo/sacada/varanda)"
+    parts = [f"Mão de obra instalação Ilha Breeze: R$ {labor:.0f} ({labor_note})."]
     if own is False:
         parts.append(
-            "Cliente sem tubulação: material ~2 m ≈ R$ 200 → total indicativo "
-            f"≈ R$ {total:.0f} (mão de obra + material)."
+            "Cliente sem tubulação: material ~2 m ≈ R$ 200. "
+            f"Total indicativo ≈ R$ {total:.0f} (mão de obra + material), sem margem em peça."
         )
     elif own is True:
         parts.append("Cliente já tem tubulação: cobrar só mão de obra conforme regra acima.")
     else:
         parts.append(
-            "Pergunte se o cliente já tem tubulação: R$ 250 é só mão de obra; "
-            "sem tubulação somar ~R$ 200 de material (média R$ 450 serviço+material)."
+            "Se o cliente já tiver tubulação, segue só mão de obra (R$ 300). "
+            "Sem tubulação, some ~R$ 200 de material (transparente, sem margem)."
         )
 
-    if needs_scaf is True:
-        parts.append(
-            "Com andaime/escada alta por fora: mão de obra a partir de R$ 300. "
-            "Aluguel do andaime o cliente paga à parte ao fornecedor: "
-            "1º andar R$ 130, 2º R$ 140, 3º R$ 160."
-        )
-        if scaffold_client is not None:
-            parts.append(f"Valor referência andaime ({sf}º andar): R$ {scaffold_client:.0f} (cliente).")
-        else:
-            parts.append(
-                "Pergunte em qual andar (1º, 2º ou 3º) para informar o valor exato do aluguel do andaime."
-            )
-    if btus is not None and int(btus) > 18000:
-        parts.append("Acima de 18.000 BTUs: instalação a partir de R$ 300 (regra potência).")
-    if easy is False:
-        parts.append(
-            "Acesso não descrito como fácil (térreo/sacada/varanda): confirmar detalhes no local."
-        )
+    parts.append(
+        "Diferencial Ilha Breeze: você paga mão de obra e material separado, "
+        "com repasse transparente de peças (sem margem escondida)."
+    )
+    parts.append(
+        "No mercado, muitos pacotes fechados ficam entre R$ 650 e R$ 700 no total."
+    )
 
     return _finalize_ok_quote(
         tool_context,
@@ -418,7 +451,7 @@ def get_pricing_quote(
             "amount_brl": round(total, 2),
             "labor_brl": round(labor, 2),
             "materials_tubing_brl": round(tubing_extra, 2),
-            "scaffold_rental_client_brl": scaffold_client,
+            "scaffold_rental_client_brl": None,
             "summary": " ".join(parts) + " Referência: São Luís.",
         },
     )
@@ -448,6 +481,8 @@ def set_lead_stage(target_stage: str, tool_context: ToolContext) -> dict[str, An
         lead_id = _resolve_lead_id(tool_context)
         row = lead_repo.set_lead_stage(lead_id, target_stage.strip())
         lead_repo.append_message(lead_id, "tool", f"set_lead_stage -> {target_stage}")
+        if row.get("stage") == "qualified":
+            _label_lead_chat(lead_id, "novo_lead")
         return {"status": "ok", "stage": row["stage"], "lead_id": str(lead_id)}
     except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
         return _db_error(e)
@@ -570,6 +605,7 @@ def mark_quote_sent(
             f"followup_quote_{lead_id}",
         )
         lead_repo.append_message(lead_id, "tool", "mark_quote_sent + followup 4h")
+        _label_lead_chat(lead_id, "orcado")
         return {
             "status": "ok",
             "followup_scheduled_at": run_at.isoformat(),
@@ -646,11 +682,15 @@ def register_appointment_request(
                 "title": "NOVO PEDIDO DE AGENDAMENTO",
                 "window_label": final_window,
                 "notes": notes,
+                "service_type": row.get("service_type") or "nao_informado",
+                "display_name": row.get("display_name") or "",
+                "address": row.get("address") or "",
             },
             f"notify_appt_{lead_id}",
         )
         lead_repo.insert_outbox_event(lead_id, "appointment_requested", {"window": final_window})
         lead_repo.append_message(lead_id, "tool", f"register_appointment_request {final_window}")
+        _label_lead_chat(lead_id, "agendado")
         name = row.get("display_name") or "Cliente"
         tell_client = (
             f"Prontinho, {name}! Seu pedido foi registrado para {final_window}. "
