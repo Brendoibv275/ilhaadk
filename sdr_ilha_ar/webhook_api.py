@@ -4,6 +4,7 @@ import asyncio
 import os
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -52,24 +53,23 @@ _handoff_cache: dict[str, bool] = {}
 
 
 def _resolve_external_channel(evolution_instance: str = "") -> str:
-    instance = str(evolution_instance or os.getenv("EVOLUTION_INSTANCE") or "").strip().lower()
-    if instance:
-        return f"whatsapp:{instance}"
+    # Operação single-instance: canal único para todos os leads.
     return "whatsapp"
 
 
 def _resolve_evolution_api_key(evolution_instance: str) -> str:
-    instance = str(evolution_instance or "").strip()
-    if instance:
-        upper = instance.upper()
-        env_direct = os.getenv(f"EVOLUTION_API_KEY_{upper}")
-        if env_direct:
-            return env_direct.strip()
-        if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip() == instance:
-            return str(os.getenv("EVOLUTION_API_KEY_A") or "").strip()
-        if str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip() == instance:
-            return str(os.getenv("EVOLUTION_API_KEY_B") or "").strip()
+    # Mantemos a assinatura para compatibilidade de chamadas existentes.
     return str(os.getenv("EVOLUTION_API_KEY") or "").strip()
+
+
+def _is_allowed_instance(inbound_instance: str) -> bool:
+    configured = str(os.getenv("EVOLUTION_INSTANCE") or "").strip().lower()
+    incoming = str(inbound_instance or "").strip().lower()
+    if not configured:
+        return True
+    if not incoming:
+        return False
+    return incoming == configured
 
 
 def _truthy(v: Any) -> bool:
@@ -216,13 +216,24 @@ def _resolve_lead_id(phone: str, evolution_instance: str = "") -> Any:
 
 
 def _sync_handoff_cache(conversation_key: str, lead_id: Any) -> bool:
-    state = repo.get_handoff_state(lead_id)
-    active = bool(state.get("active"))
+    active = repo.is_bot_paused(lead_id)
     if active:
         _handoff_cache[conversation_key] = True
     else:
         _handoff_cache.pop(conversation_key, None)
     return active
+
+
+def _clear_handoff_pause_for_lead(lead: dict[str, Any]) -> None:
+    external_user_id = str(lead.get("external_user_id") or "").strip()
+    if not external_user_id:
+        return
+    for key in list(_handoff_cache.keys()):
+        if external_user_id in key:
+            _handoff_cache.pop(key, None)
+    for key in list(_pending_by_phone.keys()):
+        if external_user_id in key:
+            _clear_pending_conversation(key)
 
 
 def _append_outbound_trace(phone: str, text: str, *, channel: str = "whatsapp", evolution_instance: str = "") -> None:
@@ -452,16 +463,17 @@ def _send_whatsapp_audio(
         _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=text_fallback)
 
 
-async def _process_pending(phone: str) -> None:
+async def _process_pending(conversation_key: str) -> None:
     await asyncio.sleep(DEBOUNCE_SECONDS)
-    pending = _pending_by_phone.get(phone)
+    pending = _pending_by_phone.get(conversation_key)
     if not pending:
         return
     payloads = pending.payloads[:]
+    lead_phone = pending.phone
     remote_jid = pending.remote_jid
     external_channel = pending.external_channel
     evolution_instance = pending.evolution_instance
-    _pending_by_phone.pop(phone, None)
+    _pending_by_phone.pop(conversation_key, None)
     reply_to_send = ""
     must_reply_audio = False
     for payload in payloads:
@@ -478,7 +490,7 @@ async def _process_pending(phone: str) -> None:
             if _contains_critical_numbers(reply_to_send):
                 _send_whatsapp_reply(
                     remote_jid=remote_jid,
-                    phone=phone,
+                    phone=lead_phone,
                     text=reply_to_send,
                     evolution_instance=evolution_instance,
                 )
@@ -488,7 +500,7 @@ async def _process_pending(phone: str) -> None:
                 if audio_data:
                     _send_whatsapp_audio(
                         remote_jid=remote_jid,
-                        phone=phone,
+                        phone=lead_phone,
                         audio_bytes=audio_data,
                         text_fallback=reply_to_send,
                         evolution_instance=evolution_instance,
@@ -496,19 +508,19 @@ async def _process_pending(phone: str) -> None:
                 else:
                     _send_whatsapp_reply(
                         remote_jid=remote_jid,
-                        phone=phone,
+                        phone=lead_phone,
                         text=reply_to_send,
                         evolution_instance=evolution_instance,
                     )
         else:
             _send_whatsapp_reply(
                 remote_jid=remote_jid,
-                phone=phone,
+                phone=lead_phone,
                 text=reply_to_send,
                 evolution_instance=evolution_instance,
             )
         _append_outbound_trace(
-            phone=phone,
+            phone=lead_phone,
             text=reply_to_send,
             channel=external_channel,
             evolution_instance=evolution_instance,
@@ -594,6 +606,12 @@ async def webhook_whatsapp(
     phone = str(parsed.get("phone") or "").strip()
     remote_jid = str(parsed.get("raw_remote_jid") or "").strip()
     evolution_instance = str(parsed.get("evolution_instance") or "").strip()
+    if not _is_allowed_instance(evolution_instance):
+        logger.warning(
+            "Inbound ignorado: instance=%s não corresponde à EVOLUTION_INSTANCE configurada.",
+            evolution_instance,
+        )
+        return {"status": "ignored", "reason": "instance_not_allowed"}
     external_channel = str(parsed.get("external_channel") or "").strip() or _resolve_external_channel(evolution_instance)
     conversation_key = f"{evolution_instance}|{(remote_jid or phone).strip()}"
     lead_id = _resolve_lead_id(phone, evolution_instance=evolution_instance) if phone else None
@@ -603,36 +621,31 @@ async def webhook_whatsapp(
         if _is_outbound_echo(payload):
             return {"status": "ignored", "reason": "outbound_echo"}
         if conversation_key and lead_id:
-            if _is_resume_command(text) or _is_human_finalization_text(text):
-                repo.set_handoff_state(lead_id, active=False, activated_by="human", reason="finalized")
-                repo.append_message(
-                    lead_id=lead_id,
-                    role="tool",
-                    body="Human handoff finalizado; bot reativado.",
-                    metadata={"event": "human_handoff_resumed", "text": text[:120]},
-                )
-                _clear_handoff_pause(conversation_key)
-                return {"status": "ok", "reason": "human_handoff_resumed"}
             if not _can_activate_handoff(lead_id):
                 return {"status": "ignored", "reason": "human_handoff_gate_blocked"}
 
             repo.set_handoff_state(lead_id, active=True, activated_by="human", reason="from_me_message")
+            repo.set_bot_paused(
+                lead_id,
+                paused=True,
+                by="human",
+                reason="human_message",
+            )
             confirmed = repo.confirm_latest_appointment_for_lead(lead_id)
             promoted = repo.promote_lead_stage_on_handoff(lead_id)
-            repo.cancel_pending_jobs_for_lead(lead_id, job_type="abandonment_check")
-            repo.cancel_pending_jobs_for_lead(lead_id, job_type="send_followup")
             repo.append_message(
                 lead_id=lead_id,
                 role="tool",
-                body="Human handoff ativado com autopromoção de agendamento.",
+                body="Bot pausado por mensagem humana (handoff ativo).",
                 metadata={
-                    "event": "human_handoff_activated",
+                    "event": "bot_paused_by_human",
                     "appointment_confirmed": bool(confirmed),
                     "lead_promoted_to_scheduled": bool(promoted),
+                    "text": text[:120],
                 },
             )
             _activate_handoff_pause(conversation_key)
-            return {"status": "ok", "reason": "human_handoff_activated"}
+            return {"status": "ok", "reason": "bot_paused_by_human"}
         return {"status": "ignored", "reason": "outbound_without_recipient"}
 
     if _is_ignored_inbound_phone(phone):
@@ -653,4 +666,42 @@ async def webhook_whatsapp(
         return {"status": "queued", "delivery": "queued", "debounce_seconds": DEBOUNCE_SECONDS}
     result = await handle_evolution_inbound(payload)
     return {**result, "delivery": "skipped"}
+
+
+@app.get("/leads/{lead_id}/bot-status")
+async def get_lead_bot_status(lead_id: str) -> dict[str, Any]:
+    lid = uuid.UUID(lead_id)
+    lead = repo.get_lead(lid)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead não encontrado")
+    return {
+        "lead_id": str(lead["id"]),
+        "bot_paused": bool(lead.get("bot_paused")),
+        "bot_paused_at": lead.get("bot_paused_at"),
+        "bot_paused_by": lead.get("bot_paused_by"),
+        "bot_paused_reason": lead.get("bot_paused_reason"),
+        "bot_reactivated_at": lead.get("bot_reactivated_at"),
+        "bot_reactivated_by": lead.get("bot_reactivated_by"),
+        "equipe_responsavel": lead.get("equipe_responsavel"),
+    }
+
+
+@app.post("/leads/{lead_id}/bot/reactivate")
+async def reactivate_lead_bot(lead_id: str) -> dict[str, Any]:
+    lid = uuid.UUID(lead_id)
+    row = repo.set_bot_paused(lid, paused=False, by="frontend", reason="manual_reactivate")
+    repo.append_message(
+        lead_id=lid,
+        role="tool",
+        body="Bot reativado manualmente via frontend.",
+        metadata={"event": "bot_reactivated_frontend"},
+    )
+    _clear_handoff_pause_for_lead(row)
+    return {
+        "status": "ok",
+        "lead_id": str(row["id"]),
+        "bot_paused": bool(row.get("bot_paused")),
+        "bot_reactivated_at": row.get("bot_reactivated_at"),
+        "bot_reactivated_by": row.get("bot_reactivated_by"),
+    }
 

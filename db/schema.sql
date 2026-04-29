@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS leads (
     tubing_complex      TEXT,
     quoted_amount       NUMERIC(12, 2),
     quote_notes         TEXT,
+    equipe_responsavel  TEXT,
+    bot_paused          BOOLEAN NOT NULL DEFAULT FALSE,
+    bot_paused_at       TIMESTAMPTZ,
+    bot_paused_by       TEXT,
+    bot_paused_reason   TEXT,
+    bot_reactivated_at  TIMESTAMPTZ,
+    bot_reactivated_by  TEXT,
     stage               TEXT NOT NULL DEFAULT 'new',
     last_inbound_at     TIMESTAMPTZ,
     last_outbound_at  TIMESTAMPTZ,
@@ -28,6 +35,14 @@ CREATE TABLE IF NOT EXISTS leads (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT leads_channel_user_unique UNIQUE (external_channel, external_user_id)
 );
+
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS equipe_responsavel TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_paused BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_paused_at TIMESTAMPTZ;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_paused_by TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_paused_reason TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_reactivated_at TIMESTAMPTZ;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_reactivated_by TEXT;
 
 CREATE INDEX IF NOT EXISTS leads_stage_idx ON leads (stage);
 CREATE INDEX IF NOT EXISTS leads_quote_sent_idx ON leads (quote_sent_at) WHERE quote_sent_at IS NOT NULL;

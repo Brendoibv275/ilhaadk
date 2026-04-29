@@ -20,44 +20,22 @@ logger = logging.getLogger(__name__)
 
 
 def _instance_from_external_channel(external_channel: str | None) -> str:
-    raw = str(external_channel or "").strip().lower()
-    if raw.startswith("whatsapp:"):
-        return raw.split(":", 1)[1].strip()
+    # Single-instance: não roteia por external_channel, usa instância global do ambiente.
+    _ = external_channel
     return ""
 
 
 def _resolve_group_for_instance(instance: str) -> str:
-    import os
-    inst = str(instance or "").strip().lower()
-    if inst:
-        if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip().lower() == inst:
-            return str(os.getenv("TECH_GROUP_JID_A") or "").strip()
-        if str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip().lower() == inst:
-            return str(os.getenv("TECH_GROUP_JID_B") or "").strip()
-        by_name = str(os.getenv(f"TECH_GROUP_JID_{inst.upper()}") or "").strip()
-        if by_name:
-            return by_name
+    _ = instance
     return str(settings.tech_group_jid or "").strip()
 
 
 def _evolution_credentials(instance_hint: str = "") -> tuple[str, str, str] | None:
+    _ = instance_hint
     import os
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
-    inst_hint = str(instance_hint or "").strip()
-    if inst_hint:
-        il = inst_hint.lower()
-        api_key = str(os.getenv(f"EVOLUTION_API_KEY_{inst_hint.upper()}") or "").strip()
-        if not api_key:
-            if str(os.getenv("EVOLUTION_INSTANCE_A") or "").strip().lower() == il:
-                api_key = str(os.getenv("EVOLUTION_API_KEY_A") or "").strip()
-            elif str(os.getenv("EVOLUTION_INSTANCE_B") or "").strip().lower() == il:
-                api_key = str(os.getenv("EVOLUTION_API_KEY_B") or "").strip()
-        instance = inst_hint
-        if not api_key:
-            api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
-    else:
-        api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
-        instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
+    api_key = (os.getenv("EVOLUTION_API_KEY") or "").strip()
+    instance = (os.getenv("EVOLUTION_INSTANCE") or "").strip()
     if not (base_url and api_key and instance):
         return None
     return base_url, api_key, instance

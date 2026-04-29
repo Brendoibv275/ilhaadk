@@ -41,6 +41,7 @@ ALLOWED_LEAD_FIELDS = frozenset(
         "tubing_complex",
         "quoted_amount",
         "quote_notes",
+        "equipe_responsavel",
     }
 )
 
@@ -233,17 +234,29 @@ def ensure_lead(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO leads (external_channel, external_user_id, last_inbound_at)
-                VALUES (%s, %s, CASE WHEN %s THEN now() ELSE NULL END)
+                INSERT INTO leads (
+                    external_channel,
+                    external_user_id,
+                    last_inbound_at,
+                    equipe_responsavel
+                )
+                VALUES (%s, %s, CASE WHEN %s THEN now() ELSE NULL END, %s)
                 ON CONFLICT (external_channel, external_user_id)
                 DO UPDATE SET
                     last_inbound_at = CASE
                         WHEN %s THEN now()
                         ELSE leads.last_inbound_at
-                    END
+                    END,
+                    equipe_responsavel = COALESCE(leads.equipe_responsavel, EXCLUDED.equipe_responsavel)
                 RETURNING id
                 """,
-                (external_channel, external_user_id, touch_inbound, touch_inbound),
+                (
+                    external_channel,
+                    external_user_id,
+                    touch_inbound,
+                    settings.equipe_responsavel,
+                    touch_inbound,
+                ),
             )
             row = cur.fetchone()
             assert row is not None
@@ -334,6 +347,53 @@ def set_handoff_state(
             if not out:
                 raise LookupError("Lead não encontrado")
             return dict(out)
+
+
+def is_bot_paused(lead_id: uuid.UUID) -> bool:
+    lead = get_lead(lead_id) or {}
+    return bool(lead.get("bot_paused"))
+
+
+def set_bot_paused(
+    lead_id: uuid.UUID,
+    *,
+    paused: bool,
+    by: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET
+                    bot_paused = %s,
+                    bot_paused_at = CASE WHEN %s THEN now() ELSE bot_paused_at END,
+                    bot_paused_by = CASE WHEN %s THEN %s ELSE bot_paused_by END,
+                    bot_paused_reason = CASE WHEN %s THEN %s ELSE bot_paused_reason END,
+                    bot_reactivated_at = CASE WHEN %s THEN bot_reactivated_at ELSE now() END,
+                    bot_reactivated_by = CASE WHEN %s THEN bot_reactivated_by ELSE %s END,
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    paused,
+                    paused,
+                    paused,
+                    by,
+                    paused,
+                    reason,
+                    paused,
+                    paused,
+                    by,
+                    str(lead_id),
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Lead não encontrado")
+            return dict(row)
 
 
 def count_messages_by_roles(lead_id: uuid.UUID, roles: tuple[str, ...]) -> int:

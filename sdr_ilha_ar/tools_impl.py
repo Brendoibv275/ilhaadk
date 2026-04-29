@@ -42,6 +42,13 @@ WEEKDAY_PT = {
     "domingo": 6,
 }
 
+FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
+    "higienizacao": 150.0,
+    "manutencao_preventiva": 150.0,
+    "carga_gas_revisao": 180.0,
+    "visita_tecnica_gratis": 0.0,
+}
+
 
 def _resolve_lead_id(tool_context: ToolContext) -> uuid.UUID:
     raw = tool_context.state.get("lead_id")
@@ -476,6 +483,18 @@ def save_lead_field(
         lead_id = _resolve_lead_id(tool_context)
         normalized = _normalize_preferred_window(value) if field_name == "preferred_window" else value
         row = lead_repo.save_lead_field(lead_id, field_name, normalized)
+        if field_name == "service_type":
+            # Ajuste de robustez: quando o atendimento avança sem get_pricing_quote,
+            # mantém quoted_amount coerente para serviços de preço fixo.
+            slug = _crm_service_slug(str(normalized).strip().lower())
+            fixed_amount = FIXED_SERVICE_QUOTES_BRL.get(slug)
+            if fixed_amount is not None and row.get("quoted_amount") is None:
+                lead_repo.save_lead_field(lead_id, "quoted_amount", str(fixed_amount))
+                lead_repo.append_message(
+                    lead_id,
+                    "tool",
+                    f"autosync quoted_amount={fixed_amount:.2f} from service_type={slug}",
+                )
         lead_repo.append_message(lead_id, "tool", f"save_lead_field {field_name}={value!r}")
         return {"status": "ok", "lead_id": str(lead_id), "stage": row.get("stage")}
     except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
@@ -678,6 +697,34 @@ def register_appointment_request(
                 "status": "error",
                 "message": f"Preencha antes de agendar: {', '.join(missing)}",
             }
+        service_slug = _crm_service_slug(str(row.get("service_type") or "").strip().lower())
+        if not service_slug:
+            return {
+                "status": "error",
+                "message": "Preencha antes de agendar: service_type",
+                "tell_client": (
+                    "Perfeito! Só vou confirmar um detalhe do serviço aqui e já te retorno."
+                ),
+            }
+        quoted_amount = row.get("quoted_amount")
+        if quoted_amount is None:
+            fixed_amount = FIXED_SERVICE_QUOTES_BRL.get(service_slug)
+            if fixed_amount is not None:
+                lead_repo.save_lead_field(lead_id, "quoted_amount", str(fixed_amount))
+                lead_repo.append_message(
+                    lead_id,
+                    "tool",
+                    f"autosync quoted_amount={fixed_amount:.2f} at appointment from service_type={service_slug}",
+                )
+                row = lead_repo.get_lead(lead_id) or row
+            else:
+                return {
+                    "status": "error",
+                    "message": "Preencha antes de agendar: quoted_amount",
+                    "tell_client": (
+                        "Perfeito! Vou só confirmar o valor certinho do serviço e já te retorno."
+                    ),
+                }
         final_window = wl or (row.get("preferred_window") or "")
         # Evita confirmar agendamento com data explícita no passado.
         dt = _extract_first_date_ddmmyyyy(final_window)

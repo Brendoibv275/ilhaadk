@@ -44,6 +44,7 @@ class Settings:
     six_month_followup_enabled: bool
     six_month_followup_days: int
     internal_notify_admin_fallback: bool
+    equipe_responsavel: str | None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -91,6 +92,7 @@ class Settings:
             .strip()
             .lower()
             in {"1", "true", "yes", "sim"},
+            equipe_responsavel=os.environ.get("EQUIPE_RESPONSAVEL"),
         )
 
 

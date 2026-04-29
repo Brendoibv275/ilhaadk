@@ -72,9 +72,8 @@ def _extract_evolution_instance(*, body: dict[str, Any], data: dict[str, Any]) -
 
 
 def _resolve_external_channel(instance: str) -> str:
-    instance = str(instance or "").strip().lower()
-    if instance:
-        return f"whatsapp:{instance}"
+    # Operação single-instance: sempre usamos o mesmo canal lógico.
+    # Isso evita segmentação por "whatsapp:<instancia>" no CRM.
     return "whatsapp"
 
 
