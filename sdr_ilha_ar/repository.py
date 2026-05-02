@@ -715,6 +715,187 @@ def create_appointment(
             return row["id"]
 
 
+# =============================================================================
+# F2+A4: Engine de agendamento com slots fixos
+# =============================================================================
+# Slots fixos do dia e rótulos usados no texto ao cliente / resumo interno.
+SLOT_LABELS: dict[str, str] = {
+    "morning_early": "08h-10h",
+    "morning_late": "10h-12h",
+    "afternoon_early": "14h-16h",
+    "afternoon_late": "16h-18h",
+}
+SLOTS_ORDER: tuple[str, ...] = (
+    "morning_early",
+    "morning_late",
+    "afternoon_early",
+    "afternoon_late",
+)
+# Limite diário por equipe (4 slots = 1 equipe saturada).
+# DESIGN DECISION: por enquanto tratamos "equipe única" e bloqueamos o slot se
+# já houver 1 appointment ativo nele. Quando adicionarmos mais equipes, bastará
+# contar por (date, slot, team_id).
+APPOINTMENT_ACTIVE_STATUSES: tuple[str, ...] = (
+    "pending_team_assignment",
+    "proposed",
+    "confirmed",
+    "realloc",
+)
+
+
+def list_appointments_for_date(appointment_date: date) -> list[dict[str, Any]]:
+    """Retorna appointments ATIVOS (não cancelados/concluídos) em uma data."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, lead_id, scheduled_date, slot, team_id, status,
+                       window_label, notes, created_at
+                FROM appointments
+                WHERE scheduled_date = %s
+                  AND status = ANY(%s)
+                ORDER BY slot ASC, created_at ASC
+                """,
+                (appointment_date, list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
+
+
+def check_slot_availability(appointment_date: date) -> dict[str, bool]:
+    """Retorna dict {slot_name: livre?} para a data informada."""
+    taken = {row["slot"] for row in list_appointments_for_date(appointment_date) if row.get("slot")}
+    return {slot: (slot not in taken) for slot in SLOTS_ORDER}
+
+
+def create_slot_appointment(
+    lead_id: uuid.UUID,
+    *,
+    appointment_date: date,
+    slot: str,
+    notes: str = "",
+    window_label: str = "",
+) -> dict[str, Any]:
+    """
+    Cria appointment estruturado (slot + date) com status pending_team_assignment.
+    Valida limite 4/dia (DESIGN DECISION: 1 equipe = 4 slots únicos).
+    Retorna dict com o appointment criado.
+    """
+    if slot not in SLOT_LABELS:
+        raise ValueError(f"Slot inválido: {slot}. Use um de {list(SLOT_LABELS)}.")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM appointments
+                WHERE scheduled_date = %s
+                  AND slot = %s
+                  AND status = ANY(%s)
+                """,
+                (appointment_date, slot, list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            row = cur.fetchone() or {}
+            if int(row.get("total") or 0) >= 1:
+                raise ValueError(
+                    f"Slot {slot} em {appointment_date.isoformat()} já está ocupado."
+                )
+            # Limite de 4/dia (redundância defensiva caso introduzamos >1 slot por período no futuro).
+            cur.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM appointments
+                WHERE scheduled_date = %s
+                  AND status = ANY(%s)
+                """,
+                (appointment_date, list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            row_day = cur.fetchone() or {}
+            if int(row_day.get("total") or 0) >= 4:
+                raise ValueError(
+                    f"Dia {appointment_date.isoformat()} já está com 4 atendimentos."
+                )
+            label = window_label or f"{appointment_date.strftime('%d/%m/%Y')} {SLOT_LABELS[slot]}"
+            cur.execute(
+                """
+                INSERT INTO appointments (
+                    lead_id, window_label, status, scheduled_date, slot, notes
+                )
+                VALUES (%s, %s, 'pending_team_assignment', %s, %s, %s)
+                RETURNING id, lead_id, scheduled_date, slot, team_id, status,
+                          window_label, notes, created_at
+                """,
+                (str(lead_id), label, appointment_date, slot, notes or None),
+            )
+            row_out = cur.fetchone()
+            assert row_out is not None
+            return {k: _jsonify_value(v) for k, v in row_out.items()}
+
+
+def get_appointment(appointment_id: uuid.UUID) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.*, l.display_name, l.phone, l.external_user_id,
+                       l.external_channel, l.address, l.latitude, l.longitude,
+                       l.service_type, l.quoted_amount
+                FROM appointments a
+                JOIN leads l ON l.id = a.lead_id
+                WHERE a.id = %s
+                """,
+                (str(appointment_id),),
+            )
+            row = cur.fetchone()
+            return {k: _jsonify_value(v) for k, v in row.items()} if row else None
+
+
+def update_appointment_status(
+    appointment_id: uuid.UUID,
+    *,
+    status: str,
+    team_id: str | None = None,
+    scheduled_date: date | None = None,
+    slot: str | None = None,
+) -> dict[str, Any]:
+    """Atualiza status / equipe / data / slot de um appointment."""
+    allowed_status = {
+        "pending_team_assignment",
+        "proposed",
+        "confirmed",
+        "realloc",
+        "cancelled",
+        "done",
+        "completed",
+    }
+    if status not in allowed_status:
+        raise ValueError(f"Status inválido: {status}")
+    sets = ["status = %s"]
+    params: list[Any] = [status]
+    if team_id is not None:
+        sets.append("team_id = %s")
+        params.append(team_id)
+    if scheduled_date is not None:
+        sets.append("scheduled_date = %s")
+        params.append(scheduled_date)
+    if slot is not None:
+        if slot not in SLOT_LABELS:
+            raise ValueError(f"Slot inválido: {slot}")
+        sets.append("slot = %s")
+        params.append(slot)
+    sets.append("updated_at = now()")
+    params.append(str(appointment_id))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE appointments SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                tuple(params),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Appointment não encontrado")
+            return {k: _jsonify_value(v) for k, v in row.items()}
+
+
 def mark_lead_completed(lead_id: uuid.UUID) -> dict[str, Any]:
     with connect() as conn:
         with conn.cursor() as cur:
