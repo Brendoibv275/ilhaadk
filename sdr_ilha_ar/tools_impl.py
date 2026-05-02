@@ -43,8 +43,8 @@ WEEKDAY_PT = {
 }
 
 FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
-    "higienizacao": 150.0,
-    "manutencao_preventiva": 150.0,
+    "higienizacao": 200.0,
+    "manutencao_preventiva": 200.0,
     "carga_gas_revisao": 180.0,
     "visita_tecnica_gratis": 0.0,
 }
@@ -259,13 +259,15 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 150.0,
-                "labor_brl": 150.0,
+                "amount_brl": 200.0,
+                "labor_brl": 200.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Higienização completa: R$ 150,00. Limpeza profunda interna "
-                    "(sujeira, mofo, bactérias). Válido em São Luís."
+                    "Limpeza/higienização padrão: a partir de R$ 200,00 (valor estimado, "
+                    "pode variar conforme o caso no local). Limpeza profunda interna "
+                    "(sujeira, mofo, bactérias). Técnicos credenciados com ART, fardados, "
+                    "3 meses de garantia no serviço. Válido em São Luís."
                 ),
             },
         )
@@ -276,11 +278,14 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 150.0,
-                "labor_brl": 150.0,
+                "amount_brl": 200.0,
+                "labor_brl": 200.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
-                "summary": "Manutenção preventiva: a partir de R$ 150,00 (São Luís).",
+                "summary": (
+                    "Manutenção preventiva: a partir de R$ 200,00 (São Luís). "
+                    "Técnicos credenciados com ART, fardados, 3 meses de garantia."
+                ),
             },
         )
     if st in ("carga_gas_revisao", "carga_gas", "gas", "recarga"):
@@ -451,7 +456,10 @@ def get_pricing_quote(
         )
 
     parts.append(
-        "Diferencial Ilha Breeze: você paga mão de obra e material separado, "
+        "Diferencial Ilha Breeze: técnicos credenciados com ART (Atestado de Responsabilidade "
+        "Técnica), fardados, com 3 meses de garantia no serviço. Nossa equipe já trabalhou em "
+        "empresas autorizadas (Elgin, Gree, Samsung, LG), então você tem a mesma qualidade "
+        "técnica que autorizada, com preço melhor. Você paga mão de obra e material separado, "
         "com repasse transparente de peças (sem margem escondida)."
     )
     parts.append(
