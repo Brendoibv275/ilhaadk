@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 import requests
@@ -152,6 +153,34 @@ def apply_whatsapp_label(*, remote_jid: str, label: str) -> dict[str, Any]:
     return {"status": "error", "message": str(last_error) if last_error else "unknown"}
 
 
+def _build_maps_link(lead: dict[str, Any]) -> str:
+    """
+    I1 — Monta linha com link do Google Maps para incluir no resumo do grupo interno.
+
+    Ordem de preferência:
+      1) Coordenadas exatas (lead.latitude/longitude): link direto com lat,lng.
+      2) Endereço em texto (lead.address): link por busca com aviso de confirmar.
+      3) Nenhum dos dois: "não informada".
+
+    DESIGN DECISION: preferimos sempre coords quando disponíveis — endereço por
+    texto depende de interpretação do Google, por isso a marca "(por texto, confirmar)".
+    """
+    lat = lead.get("latitude")
+    lng = lead.get("longitude")
+    if lat is not None and lng is not None:
+        try:
+            lat_f = float(lat)
+            lng_f = float(lng)
+            return f"📍 Localização: https://www.google.com/maps?q={lat_f},{lng_f}"
+        except (TypeError, ValueError):
+            pass
+    address = (lead.get("address") or "").strip()
+    if address:
+        encoded = urllib.parse.quote_plus(address)
+        return f"📍 Endereço (por texto, confirmar): https://www.google.com/maps?q={encoded}"
+    return "📍 Localização: não informada"
+
+
 def format_lead_notification(title: str, lead: dict[str, Any], extra: str = "") -> str:
     lines = [
         title,
@@ -161,6 +190,7 @@ def format_lead_notification(title: str, lead: dict[str, Any], extra: str = "") 
         f"Endereço: {lead.get('address') or '—'}",
         f"Janela: {lead.get('preferred_window') or '—'}",
         f"Estágio: {lead.get('stage')}",
+        _build_maps_link(lead),
     ]
     if extra:
         lines.append(extra)
