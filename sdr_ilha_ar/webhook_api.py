@@ -710,6 +710,68 @@ async def reactivate_lead_bot(lead_id: str) -> dict[str, Any]:
 
 
 # =============================================================================
+# F — Endpoints canônicos de pausa/retomada (usados pelo frontend Parte F).
+# =============================================================================
+
+
+class _PauseBotBody(BaseModel):
+    reason: str | None = None
+    by: str | None = None
+
+
+@app.post("/leads/{lead_id}/pause-bot")
+async def pause_lead_bot(
+    lead_id: str,
+    body: _PauseBotBody | None = None,
+) -> dict[str, Any]:
+    lid = uuid.UUID(lead_id)
+    reason = (body.reason if body and body.reason else "manual_pause").strip() or "manual_pause"
+    by = (body.by if body and body.by else "frontend").strip() or "frontend"
+    row = repo.pause_bot_for_lead(lid, reason=reason, by=by)
+    # Sincroniza cache de handoff local (conversation_key contém external_user_id).
+    external_user_id = str(row.get("external_user_id") or "").strip()
+    if external_user_id:
+        for key in list(_handoff_cache.keys()):
+            if external_user_id in key:
+                _handoff_cache[key] = True
+    repo.append_message(
+        lead_id=lid,
+        role="tool",
+        body=f"Bot pausado manualmente via frontend (motivo={reason}).",
+        metadata={"event": "bot_paused_frontend", "reason": reason, "by": by},
+    )
+    return {
+        "status": "ok",
+        "lead_id": str(row["id"]),
+        "bot_paused": bool(row.get("bot_paused")),
+        "bot_paused_at": row.get("bot_paused_at"),
+        "bot_paused_by": row.get("bot_paused_by"),
+        "bot_paused_reason": row.get("bot_paused_reason"),
+    }
+
+
+@app.post("/leads/{lead_id}/resume-bot")
+async def resume_lead_bot(lead_id: str) -> dict[str, Any]:
+    """Alias canônico do /bot/reactivate, pedido pela Parte F."""
+    lid = uuid.UUID(lead_id)
+    row = repo.resume_bot_for_lead(lid, by="frontend", reason="manual_resume")
+    repo.append_message(
+        lead_id=lid,
+        role="tool",
+        body="Bot retomado manualmente via frontend.",
+        metadata={"event": "bot_resumed_frontend"},
+    )
+    _clear_handoff_pause_for_lead(row)
+    return {
+        "status": "ok",
+        "lead_id": str(row["id"]),
+        "bot_paused": bool(row.get("bot_paused")),
+        "bot_reactivated_at": row.get("bot_reactivated_at"),
+        "bot_reactivated_by": row.get("bot_reactivated_by"),
+    }
+
+
+# =============================================================================
 # F5+A5 — endpoints de gestão de appointment (painel / frontend)
 # =============================================================================
 
