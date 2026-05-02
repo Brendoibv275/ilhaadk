@@ -56,28 +56,86 @@ def _process_notify_internal(job: dict[str, Any]) -> None:
 
 
 def _process_send_followup(job: dict[str, Any]) -> None:
-    """MVP: registra texto sugerido; integração WhatsApp no adaptador de canal."""
+    """MVP: registra texto sugerido; integração WhatsApp no adaptador de canal.
+
+    Suporta os templates da cadência de reengajamento (v2 pedido Kauan):
+        followup_45min, followup_1h, followup_5h, followup_1d, followup_3d
+    Cada template gera uma mensagem com prefixo [FOLLOWUP:<tag>] — o prompt do
+    agente reconhece esse prefixo e adapta tom (e no caso 3d libera cupom R$50).
+
+    Templates legados (`followup`, `orcamento_instalacao`) continuam funcionando
+    com as mensagens originais.
+    """
     import json
 
     lead_id = uuid.UUID(str(job["lead_id"]))
-    lead = lead_repo.get_lead(lead_id)
-    name = (lead or {}).get("display_name") or "Cliente"
+    lead = lead_repo.get_lead(lead_id) or {}
+    name = lead.get("display_name") or "Cliente"
     raw_pl = job.get("payload") or {}
     if isinstance(raw_pl, str):
         pl: dict[str, Any] = json.loads(raw_pl) if raw_pl.strip() else {}
     else:
         pl = raw_pl if isinstance(raw_pl, dict) else {}
     template = pl.get("template", "followup")
-    msg = (
-        f"Oi, {name}! Tudo bem? Vi que conversamos sobre o serviço. "
-        f"Ficou alguma dúvida sobre valores ou prefere uma condição de pagamento?"
-    )
-    if template == "orcamento_instalacao":
-        msg = (
+    tag = pl.get("followup_tag")
+
+    # Mensagens por template da cadência nova.
+    # As mensagens começam com [FOLLOWUP:<tag>] pra que o agente (quando re-engajar
+    # via LLM) reconheça o contexto e adapte. Por ora o stub apenas registra.
+    cadence_templates = {
+        "followup_45min": (
+            f"[FOLLOWUP:45min] Oi {name}! Só passando pra ver se ficou alguma dúvida "
+            f"sobre o orçamento. Qualquer coisa tô por aqui, tranquilo?"
+        ),
+        "followup_1h": (
+            f"[FOLLOWUP:1h] Oi {name}, tudo bem? Posso te ajudar com alguma dúvida "
+            f"sobre o serviço?"
+        ),
+        "followup_5h": (
+            f"[FOLLOWUP:5h] {name}, ainda quer fechar o serviço? Se precisar de "
+            f"condição diferente, me avisa."
+        ),
+        "followup_1d": (
+            f"[FOLLOWUP:1d] Oi {name}! Passou 1 dia e não retornou — tá tudo bem? "
+            f"Precisa de algum ajuste no orçamento ou tem alguma dúvida?"
+        ),
+        "followup_3d": (
+            f"[FOLLOWUP:3d_coupon_50] Oi {name}! 🎯 Tô liberando um cupom relâmpago "
+            f"de R$ 50 de desconto pra ti no orçamento que passei, válido pras "
+            f"próximas 48h. Bora aproveitar?"
+        ),
+    }
+
+    # Templates legados (compatibilidade).
+    legacy_templates = {
+        "followup": (
+            f"Oi, {name}! Tudo bem? Vi que conversamos sobre o serviço. "
+            f"Ficou alguma dúvida sobre valores ou prefere uma condição de pagamento?"
+        ),
+        "orcamento_instalacao": (
             f"Oi, {name}! Passando para ver se ficou alguma dúvida sobre o orçamento "
             f"de instalação ou se quer que eu veja condição melhor de pagamento."
-        )
-    logger.info("[send_followup] lead=%s template=%s -> %s", lead_id, template, msg)
+        ),
+    }
+
+    msg = cadence_templates.get(template) or legacy_templates.get(template) or legacy_templates["followup"]
+
+    # Regra de negócio do cupom de 3 dias: só vale se o lead realmente recebeu
+    # orçamento numérico. Caso contrário, cai pra reengajamento neutro.
+    if template == "followup_3d":
+        quoted_amount = lead.get("quoted_amount")
+        try:
+            quoted_num = float(quoted_amount) if quoted_amount not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            quoted_num = 0.0
+        if quoted_num <= 0:
+            msg = (
+                f"[FOLLOWUP:3d_no_quote] Oi {name}! Já faz uns dias — caso ainda "
+                f"precise do serviço, a visita técnica é gratuita. Me avisa quando "
+                f"for bom pra ti."
+            )
+
+    logger.info("[send_followup] lead=%s template=%s tag=%s -> %s", lead_id, template, tag, msg)
     lead_repo.append_message(lead_id, "assistant_outbound_stub", msg)
 
 
