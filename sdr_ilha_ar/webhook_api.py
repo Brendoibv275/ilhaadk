@@ -324,6 +324,76 @@ def _build_evolution_number_candidates(*, remote_jid: str, phone: str) -> list[s
     return out
 
 
+def _is_retriable_network_error(exc: Exception) -> bool:
+    """
+    I/3 — Classifica exceções que devem ser retentadas no envio WhatsApp.
+    Consideramos retriável: ConnectionError, Timeout, e HTTPError com status 5xx.
+    Erros 4xx (payload ruim, número inválido) não são retentados.
+    """
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        return bool(status is not None and 500 <= int(status) < 600)
+    return False
+
+
+def _retry_network_call(
+    func,
+    *args,
+    max_attempts: int = 3,
+    backoff_seconds: tuple[float, ...] = (1.0, 4.0, 16.0),
+    op_name: str = "network_call",
+    **kwargs,
+):
+    """
+    I/3 — Executa `func(*args, **kwargs)` com retry exponencial em erros de
+    rede. Tenta até `max_attempts` vezes, dormindo `backoff_seconds[i]` antes
+    da próxima tentativa. Só retenta em erros classificados como retriáveis.
+    Loga estruturadamente cada retry.
+    """
+    import time
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            retriable = _is_retriable_network_error(exc)
+            if not retriable or attempt >= max_attempts:
+                logger.warning(
+                    "I/3 retry: %s falhou definitivamente attempt=%s/%s retriable=%s erro=%s",
+                    op_name,
+                    attempt,
+                    max_attempts,
+                    retriable,
+                    exc,
+                )
+                raise
+            delay = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            logger.warning(
+                "I/3 retry: %s attempt=%s/%s falhou (retriable=%s) — retry em %.1fs. erro=%s",
+                op_name,
+                attempt,
+                max_attempts,
+                retriable,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
+
+
+def _post_whatsapp_text(*, endpoint: str, headers: dict, payload: dict) -> requests.Response:
+    """I/3 — Wrapper que isola a chamada HTTP para ficar retentável."""
+    response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+    response.raise_for_status()
+    return response
+
+
 def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str, evolution_instance: str = "") -> None:
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
     instance = str(evolution_instance or os.getenv("EVOLUTION_INSTANCE") or "").strip()
@@ -344,8 +414,14 @@ def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str, evolution_in
         for value in candidates:
             payload = {"number": value, "text": chunk}
             try:
-                response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
-                response.raise_for_status()
+                # I/3 — retry automático com backoff (1s, 4s, 16s) em erros de rede/5xx.
+                _retry_network_call(
+                    _post_whatsapp_text,
+                    endpoint=endpoint,
+                    headers=headers,
+                    payload=payload,
+                    op_name=f"whatsapp_send_text number={value}",
+                )
                 sent = True
                 break
             except Exception as exc:  # pragma: no cover - depende da API externa
