@@ -6,7 +6,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from datetime import date as date_cls
@@ -1027,4 +1027,75 @@ async def cancel_appointment(
         "appointment": updated,
         "message_sent": message,
     }
+
+
+# -----------------------------------------------------------------------------
+# H — Recall 6m pós-conclusão
+# -----------------------------------------------------------------------------
+
+RECALL_6M_DAYS = 180
+RECALL_6M_JOB_TYPE = "followup_recall_6m"
+
+
+def schedule_recall_6m_for_lead(lead_id: uuid.UUID | str) -> str | None:
+    """Enfileira um job `followup_recall_6m` para daqui 180 dias.
+
+    Idempotente: a chave `recall6m_{lead_id}` evita duplicar se o appointment
+    for marcado como completed mais de uma vez (ex: duplo clique no painel).
+    Retorna o job_id (string) ou None se já existia.
+    """
+    lid = lead_id if isinstance(lead_id, uuid.UUID) else uuid.UUID(str(lead_id))
+    run_at = datetime.now(timezone.utc) + timedelta(days=RECALL_6M_DAYS)
+    idem = f"recall6m_{lid}"
+    jid = repo.enqueue_job(
+        lid,
+        RECALL_6M_JOB_TYPE,
+        run_at,
+        {"reason": "appointment_completed", "offer_amount_brl": 280.0},
+        idem,
+    )
+    if jid is not None:
+        try:
+            repo.append_message(
+                lid,
+                "tool",
+                f"{RECALL_6M_JOB_TYPE} agendado para {run_at.isoformat()}",
+            )
+        except Exception:  # pragma: no cover — log-only side effect
+            logger.exception("append_message falhou pro recall 6m lead=%s", lid)
+    return str(jid) if jid else None
+
+
+@app.post("/appointments/{appointment_id}/complete")
+async def complete_appointment(appointment_id: str) -> dict[str, Any]:
+    """Marca appointment como concluído e agenda recall de 6 meses.
+
+    Chamado pelo painel interno quando o técnico confirma que o serviço foi
+    executado. Efeitos: status=completed + job `followup_recall_6m` com
+    `run_at = now + 180 dias` (oferta limpeza de manutenção R$ 280).
+    """
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    try:
+        updated = repo.update_appointment_status(aid, status="completed")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    lead_id_raw = updated.get("lead_id") or _existing.get("lead_id")
+    recall_job_id: str | None = None
+    if lead_id_raw:
+        try:
+            recall_job_id = schedule_recall_6m_for_lead(str(lead_id_raw))
+        except Exception:
+            logger.exception(
+                "Falha ao agendar recall 6m para lead=%s (appointment=%s)",
+                lead_id_raw,
+                aid,
+            )
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "recall_6m_job_id": recall_job_id,
+    }
+
 

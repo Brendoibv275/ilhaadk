@@ -952,6 +952,25 @@ def create_slot_appointment(
             return {k: _jsonify_value(v) for k, v in row_out.items()}
 
 
+def list_active_appointments_for_lead(lead_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Retorna appointments ATIVOS (não cancelados/concluídos) de um lead.
+
+    Usado pelo follow-up de recall 6m pra pular leads que já têm novo agendamento
+    em andamento — evita mensagem de oferta colidir com atendimento vigente.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM appointments
+                WHERE lead_id = %s AND status = ANY(%s)
+                ORDER BY created_at DESC
+                """,
+                (str(lead_id), list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
+
+
 def get_appointment(appointment_id: uuid.UUID) -> dict[str, Any] | None:
     with connect() as conn:
         with conn.cursor() as cur:
