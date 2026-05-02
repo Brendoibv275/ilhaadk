@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import time
@@ -553,7 +553,104 @@ def set_lead_stage(lead_id: uuid.UUID, new_stage: str) -> dict[str, Any]:
             )
             out = cur.fetchone()
             assert out is not None
+            # G: mantém histórico — fecha linha aberta anterior e insere nova.
+            # Só registra se realmente mudou de estágio.
+            if current != new_stage:
+                cur.execute(
+                    """
+                    UPDATE lead_stage_history
+                    SET exited_at = now()
+                    WHERE lead_id = %s AND exited_at IS NULL
+                    """,
+                    (str(lead_id),),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO lead_stage_history (lead_id, stage, entered_at)
+                    VALUES (%s, %s, now())
+                    """,
+                    (str(lead_id), new_stage),
+                )
             return dict(out)
+
+
+def get_current_stage_duration(lead_id: uuid.UUID) -> timedelta | None:
+    """Retorna timedelta desde o último entered_at do estágio atual (linha aberta).
+
+    Se não houver linha aberta em lead_stage_history, faz fallback para
+    max(entered_at) independente de exited_at. Se nada existir, retorna None.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entered_at FROM lead_stage_history
+                WHERE lead_id = %s AND exited_at IS NULL
+                ORDER BY entered_at DESC LIMIT 1
+                """,
+                (str(lead_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    """
+                    SELECT entered_at FROM lead_stage_history
+                    WHERE lead_id = %s
+                    ORDER BY entered_at DESC LIMIT 1
+                    """,
+                    (str(lead_id),),
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            entered_at = row["entered_at"]
+            now = datetime.now(timezone.utc)
+            if entered_at.tzinfo is None:
+                entered_at = entered_at.replace(tzinfo=timezone.utc)
+            return now - entered_at
+
+
+def get_stage_history(lead_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Retorna histórico de estágios do lead (ordem cronológica asc)."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, lead_id, stage, entered_at, exited_at
+                FROM lead_stage_history
+                WHERE lead_id = %s
+                ORDER BY entered_at ASC
+                """,
+                (str(lead_id),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_stage_duration_for(lead_id: uuid.UUID, stage: str) -> timedelta | None:
+    """Tempo desde o último entered_at do `stage` informado (aberto ou fechado).
+
+    Usado pelo worker de follow-up: calcula há quanto tempo o lead está (ou esteve)
+    em determinado estágio, ex: 'quoted'. Se houver linha aberta daquele stage,
+    usa-a; senão, usa a mais recente fechada.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entered_at FROM lead_stage_history
+                WHERE lead_id = %s AND stage = %s
+                ORDER BY entered_at DESC LIMIT 1
+                """,
+                (str(lead_id), stage),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            entered_at = row["entered_at"]
+            now = datetime.now(timezone.utc)
+            if entered_at.tzinfo is None:
+                entered_at = entered_at.replace(tzinfo=timezone.utc)
+            return now - entered_at
 
 
 def mark_quote_sent(lead_id: uuid.UUID) -> dict[str, Any]:
