@@ -60,6 +60,11 @@ class PendingConversation:
 _pending_by_phone: dict[str, PendingConversation] = {}
 _handoff_cache: dict[str, bool] = {}
 
+# I/4 — Healthcheck: trackeamos o último inbound/processamento em memória pra
+# complementar o banco (que pode não estar acessível no momento do /health).
+_last_inbound_received_at: datetime | None = None
+_last_inbound_processed_at: datetime | None = None
+
 
 def _resolve_external_channel(evolution_instance: str = "") -> str:
     # Operação single-instance: canal único para todos os leads.
@@ -642,6 +647,10 @@ async def _process_pending(conversation_key: str) -> None:
         except Exception:
             logger.exception("I/1: falha ao marcar mensagem como processada pmid=%s", pmid)
 
+    # I/4 — Healthcheck: guarda última atividade processada.
+    global _last_inbound_processed_at
+    _last_inbound_processed_at = datetime.now(timezone.utc)
+
 
 def _enqueue_payload(
     *,
@@ -687,8 +696,80 @@ def _enqueue_payload(
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    """
+    I/4 — Healthcheck enriquecido.
+
+    Retorna:
+    - status: "ok" | "degraded" | "down"
+    - last_msg_received_at: ISO8601 | null  (último webhook aceito)
+    - last_msg_processed_at: ISO8601 | null (último LLM processou)
+    - workers_alive: int  (tasks de debounce pendentes, proxy de atividade)
+    - time_since_last_msg_seconds: float | null
+
+    Regra de "degraded": em horário comercial (8h-18h hora de São Luís/SP,
+    UTC-3), se já recebemos alguma mensagem e o último recebimento foi há
+    mais de 600s (10 min), consideramos degradado. Se nunca recebemos nada e
+    o servidor acabou de subir, status="ok".
+    """
+    now = datetime.now(timezone.utc)
+
+    # Preferência: dados em memória (mais frescos). Fallback: Postgres.
+    last_received: datetime | None = _last_inbound_received_at
+    last_processed: datetime | None = _last_inbound_processed_at
+
+    if last_received is None or last_processed is None:
+        try:
+            db_times = repo.get_last_processed_message_times()
+            if last_received is None:
+                last_received = db_times.get("last_received_at")
+            if last_processed is None:
+                last_processed = db_times.get("last_processed_at")
+        except Exception:
+            logger.exception("/health: falha ao consultar processed_messages")
+
+    def _aware(dt: Any) -> datetime | None:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return None
+
+    last_received = _aware(last_received)
+    last_processed = _aware(last_processed)
+
+    time_since = None
+    if last_received is not None:
+        time_since = max(0.0, (now - last_received).total_seconds())
+
+    # Horário comercial São Luís / São Paulo (UTC-3).
+    sl_hour = (now.astimezone(timezone(timedelta(hours=-3)))).hour
+    business_hours = 8 <= sl_hour < 18
+
+    status = "ok"
+    if (
+        last_received is not None
+        and business_hours
+        and time_since is not None
+        and time_since > 600
+    ):
+        status = "degraded"
+
+    workers_alive = sum(
+        1 for p in _pending_by_phone.values() if p.task and not p.task.done()
+    )
+
+    def _iso(dt: datetime | None) -> str | None:
+        return dt.isoformat() if dt else None
+
+    return {
+        "status": status,
+        "last_msg_received_at": _iso(last_received),
+        "last_msg_processed_at": _iso(last_processed),
+        "workers_alive": workers_alive,
+        "time_since_last_msg_seconds": time_since,
+        "business_hours_sl": business_hours,
+    }
 
 
 @app.on_event("startup")
@@ -751,6 +832,10 @@ async def webhook_whatsapp(
                 "I/1: falha ao checar idempotência (processed_messages) — seguindo fluxo"
             )
 
+    # I/4 — Healthcheck: atualiza timestamp em memória (para /health).
+    global _last_inbound_received_at
+    _last_inbound_received_at = datetime.now(timezone.utc)
+
     external_channel = str(parsed.get("external_channel") or "").strip() or _resolve_external_channel(evolution_instance)
     conversation_key = f"{evolution_instance}|{(remote_jid or phone).strip()}"
     lead_id = _resolve_lead_id(phone, evolution_instance=evolution_instance) if phone else None
@@ -811,6 +896,9 @@ async def webhook_whatsapp(
             repo.mark_message_processed(provider_message_id)
         except Exception:
             logger.exception("I/1: falha ao marcar processed_at no caminho skipped")
+    # I/4: guarda tempo de processamento também no caminho skipped.
+    global _last_inbound_processed_at
+    _last_inbound_processed_at = datetime.now(timezone.utc)
     return {**result, "delivery": "skipped"}
 
 
