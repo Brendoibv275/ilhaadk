@@ -64,6 +64,21 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS messages_lead_created_idx ON messages (lead_id, created_at);
 
+-- G: histórico de estágios do lead (tempo em cada estágio do funil).
+CREATE TABLE IF NOT EXISTS lead_stage_history (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    lead_id     UUID NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    stage       TEXT NOT NULL,
+    entered_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    exited_at   TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS lead_stage_history_lead_idx
+    ON lead_stage_history (lead_id, entered_at DESC);
+CREATE INDEX IF NOT EXISTS lead_stage_history_open_idx
+    ON lead_stage_history (lead_id)
+    WHERE exited_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS appointments (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     lead_id             UUID NOT NULL REFERENCES leads (id) ON DELETE CASCADE,
