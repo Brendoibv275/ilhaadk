@@ -759,6 +759,41 @@ def _lead_first_name(appt: dict[str, Any]) -> str:
     return raw.split()[0]
 
 
+def _notify_lead_whatsapp(appt: dict[str, Any], text: str) -> None:
+    """Envia mensagem de texto ao lead reusando o transporte Evolution.
+
+    Tolera falhas (ambiente sem credenciais, lead sem telefone) para não
+    derrubar o endpoint REST — o status do appointment já foi persistido.
+    """
+    phone = str(appt.get("phone") or "").strip()
+    remote_jid = str(appt.get("external_user_id") or "").strip()
+    if not (phone or remote_jid):
+        logger.warning(
+            "Appointment %s sem telefone/jid; pulei notificação ao lead.",
+            appt.get("id"),
+        )
+        return
+    try:
+        _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=text)
+    except Exception:
+        logger.exception(
+            "Falha ao notificar lead (appointment=%s). Status já foi atualizado.",
+            appt.get("id"),
+        )
+    # Registra no histórico do lead independentemente do envio real.
+    lead_id = appt.get("lead_id")
+    if lead_id:
+        try:
+            repo.append_message(
+                lead_id=uuid.UUID(str(lead_id)),
+                role="assistant_outbound_stub",
+                body=text[:4000],
+                metadata={"channel": "whatsapp", "source": "appointment_endpoint"},
+            )
+        except Exception:
+            logger.exception("Falha ao registrar outbound no histórico do lead.")
+
+
 def _build_confirm_message(appt: dict[str, Any], team_id: str | None) -> str:
     slot_label = repo.SLOT_LABELS.get(str(appt.get("slot") or ""), str(appt.get("slot") or ""))
     data = _format_scheduled_date(appt.get("scheduled_date"))
@@ -828,8 +863,7 @@ async def confirm_appointment(
     # Carrega versão enriquecida (com dados do lead) para montar a mensagem.
     enriched = repo.get_appointment(aid) or {**_existing, **updated}
     message = _build_confirm_message(enriched, team_id)
-    # DESIGN DECISION: envio automático ao WhatsApp entra no próximo commit
-    # (D/2) para manter o diff focado em contrato HTTP + update de status.
+    _notify_lead_whatsapp(enriched, message)
     return {
         "status": "ok",
         "appointment": updated,
@@ -866,7 +900,7 @@ async def realloc_appointment(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     enriched = repo.get_appointment(aid) or {**_existing, **updated}
     message = _build_realloc_message(enriched)
-    # DESIGN DECISION: envio ao WhatsApp entra em D/2.
+    _notify_lead_whatsapp(enriched, message)
     return {
         "status": "ok",
         "appointment": updated,
@@ -889,7 +923,7 @@ async def cancel_appointment(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     enriched = repo.get_appointment(aid) or {**_existing, **updated}
     message = _build_cancel_message(enriched, body.reason)
-    # DESIGN DECISION: envio ao WhatsApp entra em D/2.
+    _notify_lead_whatsapp(enriched, message)
     return {
         "status": "ok",
         "appointment": updated,
