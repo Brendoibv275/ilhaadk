@@ -47,6 +47,8 @@ FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
     "manutencao_preventiva": 200.0,
     "carga_gas_revisao": 180.0,
     "visita_tecnica_gratis": 0.0,
+    # H — limpeza de manutenção promocional 6m pós-conclusão.
+    "limpeza_recall_6m": 280.0,
 }
 
 
@@ -252,6 +254,26 @@ def get_pricing_quote(
     else:
         st = raw.replace(" ", "_").replace("ção", "cao")
     # aliases
+    if st in ("limpeza_recall_6m", "recall_6m", "manutencao_recall_6m"):
+        # H — oferta promocional pós-recall 6 meses.
+        return _finalize_ok_quote(
+            tool_context,
+            "limpeza_recall_6m",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 280.0,
+                "labor_brl": 280.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Limpeza de manutenção promocional (cliente retorno 6 meses): "
+                    "R$ 280,00 — valor especial. Inclui higienização completa + "
+                    "revisão geral. Técnicos credenciados com ART, 3 meses de "
+                    "garantia. São Luís."
+                ),
+            },
+        )
     if st in ("limpeza", "higienizacao"):
         return _finalize_ok_quote(
             tool_context,

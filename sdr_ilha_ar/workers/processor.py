@@ -252,6 +252,46 @@ def _process_six_month_cleaning_followup(job: dict[str, Any]) -> None:
         {"job_id": str(job["id"])},
     )
 
+
+def _process_followup_recall_6m(job: dict[str, Any]) -> None:
+    """H — Recall 6 meses pós-conclusão.
+
+    Disparado 180 dias após marcar appointment como completed. Regras:
+    - Se lead não existe mais: pula.
+    - Se lead já tem appointment ativo (pending/proposed/confirmed/realloc): pula
+      (não queremos oferta de recall colidindo com atendimento em curso).
+    - Caso contrário, grava mensagem com prefixo [FOLLOWUP:6m_recall] pra que o
+      agente LLM adapte o tom e ofereça limpeza de manutenção por R$ 280.
+    """
+    lead_id = uuid.UUID(str(job["lead_id"]))
+    lead = lead_repo.get_lead(lead_id)
+    if not lead:
+        logger.info("[followup_recall_6m] lead=%s nao existe, pulado", lead_id)
+        return
+
+    # Evita colidir com atendimento em andamento.
+    try:
+        active = lead_repo.list_active_appointments_for_lead(lead_id)
+    except AttributeError:
+        # Compat: instalação antiga sem a helper ainda — segue o fluxo.
+        active = []
+    if active:
+        logger.info(
+            "[followup_recall_6m] lead=%s tem %d appointment(s) ativo(s), pulado",
+            lead_id,
+            len(active),
+        )
+        return
+
+    name = lead.get("display_name") or "Cliente"
+    msg = (
+        f"[FOLLOWUP:6m_recall] E aí {name}! Passou 6 meses desde o último "
+        f"serviço. Tô liberando uma limpeza de manutenção promocional por "
+        f"R$ 280 (valor especial cliente retorno). Quer que eu agende?"
+    )
+    logger.info("[followup_recall_6m] lead=%s disparando oferta R$280", lead_id)
+    lead_repo.append_message(lead_id, "assistant_outbound_stub", msg)
+
 def process_job(job: dict[str, Any]) -> None:
     jid = uuid.UUID(str(job["id"]))
     jtype = job["job_type"]
@@ -268,6 +308,8 @@ def process_job(job: dict[str, Any]) -> None:
             _process_abandonment_check(job)
         elif jtype == "six_month_cleaning_followup":
             _process_six_month_cleaning_followup(job)
+        elif jtype == "followup_recall_6m":
+            _process_followup_recall_6m(job)
         else:
             raise ValueError(f"job_type desconhecido: {jtype}")
         lead_repo.complete_job(jid)
