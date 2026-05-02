@@ -264,10 +264,10 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Limpeza/higienização padrão: a partir de R$ 200,00 (valor estimado, "
-                    "pode variar conforme o caso no local). Limpeza profunda interna "
-                    "(sujeira, mofo, bactérias). Técnicos credenciados com ART, fardados, "
-                    "3 meses de garantia no serviço. Válido em São Luís."
+                    "Limpeza/higienização padrão: na faixa de R$ 200,00 — o técnico confirma "
+                    "o valor final na hora depois de avaliar as condições. Limpeza profunda "
+                    "interna (sujeira, mofo, bactérias). Técnicos credenciados com ART, "
+                    "fardados, 3 meses de garantia no serviço. Válido em São Luís."
                 ),
             },
         )
@@ -283,8 +283,9 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Manutenção preventiva: a partir de R$ 200,00 (São Luís). "
-                    "Técnicos credenciados com ART, fardados, 3 meses de garantia."
+                    "Manutenção preventiva: na faixa de R$ 200,00 — o técnico confirma o "
+                    "valor final na hora. Técnicos credenciados com ART, fardados, 3 meses "
+                    "de garantia. São Luís."
                 ),
             },
         )
@@ -299,7 +300,10 @@ def get_pricing_quote(
                 "labor_brl": 180.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
-                "summary": "Carga de gás + revisão: a partir de R$ 180,00 (São Luís).",
+                "summary": (
+                    "Carga de gás + revisão: na faixa de R$ 180,00 — o técnico confirma o "
+                    "valor final na hora. São Luís."
+                ),
             },
         )
 
@@ -315,9 +319,10 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Visita técnica presencial gratuita para avaliação (sem orçamento remoto "
-                    "nesse caso). Indicado: cassete/piso-teto, quebra de teto/fiação, não gela/"
-                    "vazamento, cliente não sabe explicar o problema. São Luís."
+                    "Caso que precisa de avaliação presencial antes de fechar valor "
+                    "(técnico vai no local). Indicado: cassete/piso-teto, quebra de "
+                    "teto/fiação, não gela/vazamento, cliente não sabe explicar o problema. "
+                    "São Luís."
                 ),
             },
         )
@@ -360,8 +365,9 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Para evitar erro no diagnóstico, vamos de visita técnica gratuita. "
-                    "Assim avaliamos o local com segurança e te passamos o melhor cenário."
+                    "Pra evitar erro no diagnóstico, o técnico precisa passar aí pra avaliar "
+                    "no local antes de fechar valor. Assim a gente garante que não tem "
+                    "surpresa no orçamento."
                 ),
             },
         )
@@ -379,8 +385,8 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Nesse caso, precisamos de visita técnica presencial gratuita antes de "
-                    "passar orçamento, pois há necessidade de quebra estrutural/fiação."
+                    "Nesse caso, o técnico precisa passar aí pra avaliar antes de passar "
+                    "valor, porque tem necessidade de quebra estrutural/fiação."
                 ),
             },
         )
@@ -409,8 +415,8 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Se o acesso ainda não está claro, seguimos com visita técnica gratuita. "
-                    "É o caminho mais seguro para fechar o orçamento sem erro."
+                    "Como o acesso ainda não está claro, o técnico precisa passar aí pra "
+                    "avaliar no local. É o caminho mais seguro pra fechar o orçamento sem erro."
                 ),
             },
         )
@@ -427,8 +433,8 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Para instalação com acesso complexo (altura/andaime/área externa), "
-                    "vamos de visita técnica gratuita para avaliar com segurança."
+                    "Pra instalação com acesso complexo (altura/andaime/área externa), "
+                    "o técnico precisa passar aí pra avaliar no local antes de fechar valor."
                 ),
             },
         )
@@ -441,18 +447,22 @@ def get_pricing_quote(
 
     total = labor + tubing_extra
     labor_note = "instalação padrão com acesso fácil (térreo/sacada/varanda)"
-    parts = [f"Mão de obra instalação Ilha Breeze: R$ {labor:.0f} ({labor_note})."]
+    parts = [
+        f"Mão de obra instalação Ilha Breeze: na faixa de R$ {labor:.0f} "
+        f"({labor_note}) — o técnico confirma o valor final na hora."
+    ]
     if own is False:
         parts.append(
-            "Cliente sem tubulação: material ~2 m ≈ R$ 200. "
-            f"Total indicativo ≈ R$ {total:.0f} (mão de obra + material), sem margem em peça."
+            "Cliente sem tubulação: material ~2 m na faixa de R$ 200. "
+            f"Total indicativo na faixa de R$ {total:.0f} (mão de obra + material), "
+            "sem margem em peça."
         )
     elif own is True:
-        parts.append("Cliente já tem tubulação: cobrar só mão de obra conforme regra acima.")
+        parts.append("Cliente já tem tubulação: cobra só mão de obra conforme regra acima.")
     else:
         parts.append(
-            "Se o cliente já tiver tubulação, segue só mão de obra (R$ 300). "
-            "Sem tubulação, some ~R$ 200 de material (transparente, sem margem)."
+            "Se o cliente já tiver tubulação, segue só mão de obra (na faixa de R$ 300). "
+            "Sem tubulação, some uns R$ 200 de material (transparente, sem margem)."
         )
 
     parts.append(
