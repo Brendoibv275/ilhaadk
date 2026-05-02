@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sdr_ilha_ar import repository as lead_repo
@@ -78,6 +78,43 @@ def _process_send_followup(job: dict[str, Any]) -> None:
         pl = raw_pl if isinstance(raw_pl, dict) else {}
     template = pl.get("template", "followup")
     tag = pl.get("followup_tag")
+
+    # G: gate do follow-up amarrado ao estágio.
+    # A cadência (45min, 1h, 5h, 1d, 3d) é contada a partir do momento em que o
+    # lead entrou em 'quoted' — não da última mensagem. Se o lead:
+    #   (a) não está mais em 'quoted' (avançou ou voltou a estágio anterior), pula;
+    #   (b) está em 'quoted' há menos tempo que o threshold (ex: reentrou), pula;
+    # Isso evita disparar cupom R$50 em lead que já agendou ou que acabou de
+    # ser requotado. Templates legados ficam isentos da checagem.
+    cadence_thresholds = {
+        "followup_45min": timedelta(minutes=45),
+        "followup_1h": timedelta(hours=1),
+        "followup_5h": timedelta(hours=5),
+        "followup_1d": timedelta(days=1),
+        "followup_3d": timedelta(days=3),
+    }
+    threshold = cadence_thresholds.get(template)
+    if threshold is not None:
+        current_stage = lead.get("stage")
+        if current_stage != "quoted":
+            logger.info(
+                "[send_followup] lead=%s template=%s pulado — estagio atual=%s (nao e quoted)",
+                lead_id, template, current_stage,
+            )
+            return
+        quoted_dur = lead_repo.get_stage_duration_for(lead_id, "quoted")
+        if quoted_dur is None:
+            # Sem histórico (lead antigo pré-migration). Segue o fluxo.
+            logger.info(
+                "[send_followup] lead=%s template=%s sem historico de quoted, prosseguindo",
+                lead_id, template,
+            )
+        elif quoted_dur < threshold:
+            logger.info(
+                "[send_followup] lead=%s template=%s pulado — quoted ha %s < threshold %s",
+                lead_id, template, quoted_dur, threshold,
+            )
+            return
 
     # Mensagens por template da cadência nova.
     # As mensagens começam com [FOLLOWUP:<tag>] pra que o agente (quando re-engajar
