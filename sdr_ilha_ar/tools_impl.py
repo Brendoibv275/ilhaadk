@@ -43,8 +43,8 @@ WEEKDAY_PT = {
 }
 
 FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
-    "higienizacao": 150.0,
-    "manutencao_preventiva": 150.0,
+    "higienizacao": 200.0,
+    "manutencao_preventiva": 200.0,
     "carga_gas_revisao": 180.0,
     "visita_tecnica_gratis": 0.0,
 }
@@ -259,13 +259,15 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 150.0,
-                "labor_brl": 150.0,
+                "amount_brl": 200.0,
+                "labor_brl": 200.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Higienização completa: R$ 150,00. Limpeza profunda interna "
-                    "(sujeira, mofo, bactérias). Válido em São Luís."
+                    "Limpeza/higienização padrão: a partir de R$ 200,00 (valor estimado, "
+                    "pode variar conforme o caso no local). Limpeza profunda interna "
+                    "(sujeira, mofo, bactérias). Técnicos credenciados com ART, fardados, "
+                    "3 meses de garantia no serviço. Válido em São Luís."
                 ),
             },
         )
@@ -276,11 +278,14 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 150.0,
-                "labor_brl": 150.0,
+                "amount_brl": 200.0,
+                "labor_brl": 200.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
-                "summary": "Manutenção preventiva: a partir de R$ 150,00 (São Luís).",
+                "summary": (
+                    "Manutenção preventiva: a partir de R$ 200,00 (São Luís). "
+                    "Técnicos credenciados com ART, fardados, 3 meses de garantia."
+                ),
             },
         )
     if st in ("carga_gas_revisao", "carga_gas", "gas", "recarga"):
@@ -451,7 +456,10 @@ def get_pricing_quote(
         )
 
     parts.append(
-        "Diferencial Ilha Breeze: você paga mão de obra e material separado, "
+        "Diferencial Ilha Breeze: técnicos credenciados com ART (Atestado de Responsabilidade "
+        "Técnica), fardados, com 3 meses de garantia no serviço. Nossa equipe já trabalhou em "
+        "empresas autorizadas (Elgin, Gree, Samsung, LG), então você tem a mesma qualidade "
+        "técnica que autorizada, com preço melhor. Você paga mão de obra e material separado, "
         "com repasse transparente de peças (sem margem escondida)."
     )
     parts.append(
@@ -643,19 +651,47 @@ def mark_quote_sent(
                 pass
 
         lead_repo.mark_quote_sent(lead_id)
-        run_at = datetime.now(timezone.utc) + timedelta(hours=4)
-        lead_repo.enqueue_job(
+
+        # Cadência de follow-ups automáticos após orçamento enviado.
+        # Pedido do Kauan (v2): 45min, 1h, 5h, 1d, 3d (+cupom R$50 pra 3d).
+        # Os templates são distinguidos via `template` no payload; o prompt do agente
+        # reconhece cada um via prefixo [FOLLOWUP:<tag>] e ajusta tom/oferta.
+        now_utc = datetime.now(timezone.utc)
+        followup_schedule = [
+            (timedelta(minutes=45), "followup_45min", "45min"),
+            (timedelta(hours=1),    "followup_1h",    "1h"),
+            (timedelta(hours=5),    "followup_5h",    "5h"),
+            (timedelta(days=1),     "followup_1d",    "1d"),
+            (timedelta(days=3),     "followup_3d",    "3d_coupon_50"),
+        ]
+        scheduled: list[str] = []
+        for delta, template, tag in followup_schedule:
+            run_at = now_utc + delta
+            try:
+                lead_repo.enqueue_job(
+                    lead_id,
+                    "send_followup",
+                    run_at,
+                    {"template": template, "followup_tag": tag},
+                    f"{template}_{lead_id}",
+                )
+                scheduled.append(f"{tag}@{run_at.isoformat()}")
+            except Exception:
+                # Não falha o mark_quote_sent se 1 followup específico não enfileirar
+                # (ex: colisão de idempotência em retry). Log e segue.
+                logger.exception("Falha ao enfileirar followup %s lead=%s", template, lead_id)
+
+        run_at = now_utc + timedelta(minutes=45)  # compat com retorno legado
+        lead_repo.append_message(
             lead_id,
-            "send_followup",
-            run_at,
-            {"template": "orcamento_instalacao"},
-            f"followup_quote_{lead_id}",
+            "tool",
+            f"mark_quote_sent + cadencia followup ({len(scheduled)} jobs)",
         )
-        lead_repo.append_message(lead_id, "tool", "mark_quote_sent + followup 4h")
         _label_lead_chat(lead_id, "orcado")
         return {
             "status": "ok",
             "followup_scheduled_at": run_at.isoformat(),
+            "followup_cadence": scheduled,
             "quoted_amount_synced": total or None,
         }
     except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
