@@ -690,6 +690,82 @@ def append_message(
             return row["id"]
 
 
+# =============================================================================
+# I/1 — Idempotência de mensagens do WhatsApp (provider_message_id).
+# =============================================================================
+
+
+def register_processed_message(
+    provider_message_id: str,
+    lead_id: uuid.UUID | None = None,
+) -> bool:
+    """
+    Tenta registrar uma mensagem como processada.
+
+    Retorna True se foi inserida (mensagem NOVA) ou False se já existia
+    (duplicata — o webhook deve fazer skip). Usa INSERT ... ON CONFLICT DO
+    NOTHING pra atomicidade mesmo com webhooks chegando em paralelo.
+    """
+    key = str(provider_message_id or "").strip()
+    if not key:
+        return True  # sem id, processa normal (não tem como deduplicar)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO processed_messages (provider_message_id, lead_id)
+                VALUES (%s, %s)
+                ON CONFLICT (provider_message_id) DO NOTHING
+                RETURNING id
+                """,
+                (key, str(lead_id) if lead_id else None),
+            )
+            row = cur.fetchone()
+            return row is not None
+
+
+def mark_message_processed(provider_message_id: str) -> None:
+    """Marca `processed_at = now()` para o provider_message_id (best-effort)."""
+    key = str(provider_message_id or "").strip()
+    if not key:
+        return
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processed_messages
+                SET processed_at = now()
+                WHERE provider_message_id = %s
+                """,
+                (key,),
+            )
+
+
+def get_last_processed_message_times() -> dict[str, Any]:
+    """
+    Retorna dict com last_received_at / last_processed_at para o endpoint /health.
+    Faz fallback seguro (None) se a tabela ainda não existir.
+    """
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT MAX(received_at) AS last_received_at,
+                           MAX(processed_at) AS last_processed_at
+                      FROM processed_messages
+                    """
+                )
+                row = cur.fetchone() or {}
+                return {
+                    "last_received_at": row.get("last_received_at"),
+                    "last_processed_at": row.get("last_processed_at"),
+                }
+    except Exception:
+        logger.exception("get_last_processed_message_times: falha consultando processed_messages")
+        return {"last_received_at": None, "last_processed_at": None}
+
+
 def enqueue_job(
     lead_id: uuid.UUID,
     job_type: str,

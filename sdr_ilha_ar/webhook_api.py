@@ -75,6 +75,29 @@ def _is_allowed_instance(inbound_instance: str) -> bool:
     return incoming == configured
 
 
+def _extract_provider_message_id(payload: dict[str, Any]) -> str:
+    """
+    I/1 — Extrai o provider_message_id do payload Evolution/Meta.
+    Retorna string vazia se não encontrar (fallback: processa normal).
+    """
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(data, dict):
+        key = data.get("key") if isinstance(data.get("key"), dict) else {}
+        for candidate in (
+            key.get("id") if isinstance(key, dict) else None,
+            data.get("id"),
+            data.get("messageId"),
+            data.get("message_id"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    # Top-level (Meta Cloud etc.)
+    for candidate in (payload.get("id"), payload.get("messageId")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
 def _truthy(v: Any) -> bool:
     if isinstance(v, bool):
         return v
@@ -476,6 +499,7 @@ async def _process_pending(conversation_key: str) -> None:
     remote_jid = pending.remote_jid
     external_channel = pending.external_channel
     evolution_instance = pending.evolution_instance
+    message_ids_processed = list(pending.message_ids)
     _pending_by_phone.pop(conversation_key, None)
     reply_to_send = ""
     must_reply_audio = False
@@ -528,6 +552,13 @@ async def _process_pending(conversation_key: str) -> None:
             channel=external_channel,
             evolution_instance=evolution_instance,
         )
+
+    # I/1 — marca processed_at no banco para cada provider_message_id do lote.
+    for pmid in message_ids_processed:
+        try:
+            repo.mark_message_processed(pmid)
+        except Exception:
+            logger.exception("I/1: falha ao marcar mensagem como processada pmid=%s", pmid)
 
 
 def _enqueue_payload(
@@ -615,6 +646,29 @@ async def webhook_whatsapp(
             evolution_instance,
         )
         return {"status": "ignored", "reason": "instance_not_allowed"}
+
+    # I/1 — Idempotência: se esse provider_message_id já foi registrado, é
+    # retry/duplicata do provedor. Skip e loga.
+    provider_message_id = _extract_provider_message_id(payload)
+    if provider_message_id:
+        try:
+            inserted = repo.register_processed_message(provider_message_id)
+            if not inserted:
+                logger.info(
+                    "I/1: mensagem duplicada ignorada provider_id=%s phone=%s",
+                    provider_message_id,
+                    phone,
+                )
+                return {
+                    "status": "ignored",
+                    "reason": "duplicate_provider_message_id",
+                    "provider_message_id": provider_message_id,
+                }
+        except Exception:
+            logger.exception(
+                "I/1: falha ao checar idempotência (processed_messages) — seguindo fluxo"
+            )
+
     external_channel = str(parsed.get("external_channel") or "").strip() or _resolve_external_channel(evolution_instance)
     conversation_key = f"{evolution_instance}|{(remote_jid or phone).strip()}"
     lead_id = _resolve_lead_id(phone, evolution_instance=evolution_instance) if phone else None
@@ -668,6 +722,13 @@ async def webhook_whatsapp(
         )
         return {"status": "queued", "delivery": "queued", "debounce_seconds": DEBOUNCE_SECONDS}
     result = await handle_evolution_inbound(payload)
+    # I/1: mesmo no caminho "skipped" (sem remote_jid/phone), marcamos
+    # processed_at se conseguimos identificar provider_message_id.
+    if provider_message_id:
+        try:
+            repo.mark_message_processed(provider_message_id)
+        except Exception:
+            logger.exception("I/1: falha ao marcar processed_at no caminho skipped")
     return {**result, "delivery": "skipped"}
 
 

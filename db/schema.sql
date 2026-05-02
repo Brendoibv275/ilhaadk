@@ -64,6 +64,21 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS messages_lead_created_idx ON messages (lead_id, created_at);
 
+-- I/1: Idempotência de webhooks WhatsApp.
+-- Provider manda o mesmo message_id em retries — registramos o id e fazemos
+-- INSERT ... ON CONFLICT DO NOTHING pra skip de duplicatas.
+CREATE TABLE IF NOT EXISTS processed_messages (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider_message_id     TEXT NOT NULL,
+    lead_id                 UUID REFERENCES leads(id) ON DELETE SET NULL,
+    received_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at            TIMESTAMPTZ,
+    CONSTRAINT processed_messages_provider_id_unique UNIQUE (provider_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS processed_messages_received_at_idx
+    ON processed_messages (received_at DESC);
+
 -- G: histórico de estágios do lead (tempo em cada estágio do funil).
 CREATE TABLE IF NOT EXISTS lead_stage_history (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
