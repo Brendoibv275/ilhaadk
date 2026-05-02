@@ -531,6 +531,28 @@ async def handle_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         text=str(parsed.get("text") or ""),
         external_channel=str(parsed["external_channel"]),
     )
+
+    # F — Guarda de segurança: ANTES de invocar o LLM, checa se o bot foi
+    # pausado para esse lead (manual ou auto por humano respondendo).
+    # O webhook_api já filtra com cache, mas entradas vindas por rota
+    # alternativa (ex: testes, outros provedores) precisam desse cinto.
+    try:
+        lead_id_guard = lead_repo.ensure_lead(
+            str(parsed["external_channel"]), phone, touch_inbound=False
+        )
+        if lead_id_guard and lead_repo.is_bot_paused(lead_id_guard):
+            logger.info(
+                "F/guard: bot pausado para lead=%s — pulando LLM (phone=%s)",
+                lead_id_guard,
+                phone,
+            )
+            envelope = build_http_response_envelope("")
+            envelope["bot_paused"] = True
+            envelope["skipped_reason"] = "bot_paused"
+            return envelope
+    except Exception:
+        logger.exception("F/guard: falha ao verificar bot_paused — seguindo fluxo")
+
     text = parsed["text"]
     # Se veio location e não veio texto, injeta texto sintético para o agente
     # continuar o fluxo naturalmente.

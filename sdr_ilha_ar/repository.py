@@ -356,6 +356,30 @@ def is_bot_paused(lead_id: uuid.UUID) -> bool:
     return bool(lead.get("bot_paused"))
 
 
+def pause_bot_for_lead(
+    lead_id: uuid.UUID,
+    *,
+    reason: str = "",
+    by: str = "system",
+) -> dict[str, Any]:
+    """Wrapper de alto nível: pausa o bot pra este lead.
+
+    Contrato amigável para os endpoints REST e detecção automática.
+    Internamente delega para `set_bot_paused` (que lida com os timestamps).
+    """
+    return set_bot_paused(lead_id, paused=True, by=by, reason=reason)
+
+
+def resume_bot_for_lead(
+    lead_id: uuid.UUID,
+    *,
+    by: str = "system",
+    reason: str = "manual_resume",
+) -> dict[str, Any]:
+    """Wrapper de alto nível: retoma o bot (espelho de `pause_bot_for_lead`)."""
+    return set_bot_paused(lead_id, paused=False, by=by, reason=reason)
+
+
 def set_bot_paused(
     lead_id: uuid.UUID,
     *,
