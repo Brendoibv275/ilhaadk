@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -862,3 +862,209 @@ def get_lead_status(tool_context: ToolContext) -> dict[str, Any]:
         }
     except DatabaseNotConfiguredError as e:
         return _db_error(e)
+
+
+# =============================================================================
+# F2+A4: Tools de agendamento com slots fixos (check_availability / book_slot)
+# =============================================================================
+# DESIGN DECISION: essas tools são a interface do LLM com a engine de slots
+# já implementada em repository.py. Elas NÃO tomam decisão de negócio própria —
+# só traduzem data humana (DD/MM/AAAA) -> datetime.date, chamam o repository,
+# e montam `tell_client` em PT-BR pronto pro modelo ler ao cliente.
+
+def _parse_ddmmyyyy(value: str) -> _date | None:
+    """Converte 'DD/MM/AAAA' -> date. Retorna None se inválido."""
+    raw = (value or "").strip()
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", raw)
+    if not m:
+        return None
+    day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return _date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _format_free_slots_pt(slots: dict[str, bool]) -> str:
+    """Monta lista humana de slots livres, ex.: '8h-10h, 14h-16h e 16h-18h'."""
+    labels = [
+        lead_repo.SLOT_LABELS[s]
+        for s in lead_repo.SLOTS_ORDER
+        if slots.get(s)
+    ]
+    # Troca '08h-10h' por '8h-10h' para ficar natural em PT-BR.
+    labels = [lbl.lstrip("0") if lbl.startswith("0") else lbl for lbl in labels]
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} e {labels[1]}"
+    return ", ".join(labels[:-1]) + f" e {labels[-1]}"
+
+
+def check_availability(date: str, tool_context: ToolContext) -> dict[str, Any]:
+    """
+    Consulta disponibilidade de slots (manhã/tarde) numa data específica.
+
+    Args:
+        date: data no formato DD/MM/AAAA (ex.: "05/05/2026").
+
+    Returns:
+        status: ok/error;
+        date: data solicitada (DD/MM/AAAA);
+        slots: dict com cada slot -> "livre" ou "ocupado";
+        slot_labels: dict com rótulo humano de cada slot (ex.: "08h-10h");
+        tell_client: string pronta em PT-BR para o LLM ler ao cliente.
+    """
+    # DESIGN DECISION: `tool_context` é aceito (padrão das outras tools) mas não
+    # é estritamente necessário aqui — checagem de slot é global por data, não
+    # por lead. Mantido para uniformidade do registry ADK.
+    del tool_context  # não usado; apenas parte da assinatura ADK.
+    parsed = _parse_ddmmyyyy(date)
+    if parsed is None:
+        return {
+            "status": "error",
+            "message": f"Data inválida: {date!r}. Use formato DD/MM/AAAA.",
+            "tell_client": (
+                "Me confirma a data desejada no formato dia/mês/ano (ex.: 05/05/2026), "
+                "por favor?"
+            ),
+        }
+    try:
+        slots_bool = lead_repo.check_slot_availability(parsed)
+    except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
+        return _db_error(e)
+
+    slots_str = {
+        slot: ("livre" if free else "ocupado")
+        for slot, free in slots_bool.items()
+    }
+    slot_labels = dict(lead_repo.SLOT_LABELS)
+    date_human = parsed.strftime("%d/%m/%Y")
+    free_any = any(slots_bool.values())
+    if not free_any:
+        tell_client = (
+            f"No dia {date_human} já estou com 4 atendimentos marcados. "
+            "Tem outro dia bom pra ti?"
+        )
+    else:
+        free_list = _format_free_slots_pt(slots_bool)
+        tell_client = (
+            f"No dia {date_human} tenho livres: {free_list}. Qual prefere?"
+        )
+    return {
+        "status": "ok",
+        "date": date_human,
+        "slots": slots_str,
+        "slot_labels": slot_labels,
+        "tell_client": tell_client,
+    }
+
+
+def book_slot(
+    date: str,
+    slot: str,
+    tool_context: ToolContext,
+    notes: str = "",
+) -> dict[str, Any]:
+    """
+    Reserva um slot específico (DD/MM/AAAA + slot) para o lead atual.
+
+    Args:
+        date: data no formato DD/MM/AAAA.
+        slot: um de morning_early | morning_late | afternoon_early | afternoon_late.
+        notes: observações livres (opcional).
+
+    Returns:
+        status: ok/error;
+        appointment_id: uuid do agendamento criado (quando ok);
+        date, slot, slot_label: eco dos dados confirmados;
+        tell_client: mensagem pronta em PT-BR;
+        requires_team_assignment: sempre True (equipe é atribuída depois por humano).
+    """
+    parsed = _parse_ddmmyyyy(date)
+    if parsed is None:
+        return {
+            "status": "error",
+            "message": f"Data inválida: {date!r}. Use formato DD/MM/AAAA.",
+            "tell_client": (
+                "Me confirma a data no formato dia/mês/ano (ex.: 05/05/2026), por favor?"
+            ),
+        }
+    slot_key = (slot or "").strip()
+    if slot_key not in lead_repo.SLOT_LABELS:
+        return {
+            "status": "error",
+            "message": (
+                f"Slot inválido: {slot!r}. Use um de "
+                f"{list(lead_repo.SLOT_LABELS)}."
+            ),
+            "tell_client": (
+                "Qual horário prefere: 8h-10h, 10h-12h, 14h-16h ou 16h-18h?"
+            ),
+        }
+    try:
+        lead_id = _resolve_lead_id(tool_context)
+        appt = lead_repo.create_slot_appointment(
+            lead_id,
+            appointment_date=parsed,
+            slot=slot_key,
+            notes=notes or "",
+        )
+    except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
+        return _db_error(e)
+    except ValueError as e:
+        # Slot ocupado ou dia cheio — mensagem amigável ao cliente.
+        msg = str(e)
+        low = msg.lower()
+        date_human = parsed.strftime("%d/%m/%Y")
+        if "já está com 4" in msg or "4 atendimentos" in low:
+            tell = (
+                f"Poxa, o dia {date_human} já fechou com 4 atendimentos. "
+                "Tem outro dia bom pra ti?"
+            )
+        else:
+            label = lead_repo.SLOT_LABELS.get(slot_key, slot_key)
+            label_human = label.lstrip("0") if label.startswith("0") else label
+            tell = (
+                f"O horário das {label_human} do dia {date_human} acabou de ser "
+                "reservado. Posso ver outro horário nesse mesmo dia?"
+            )
+        return {"status": "error", "message": msg, "tell_client": tell}
+    except LookupError as e:
+        return {"status": "error", "message": str(e)}
+
+    # Best effort: avança o funil e etiqueta o chat (não bloqueia retorno).
+    try:
+        _advance_lead_to_scheduled(lead_id)
+    except Exception:
+        logger.exception("Falha ao avançar funil após book_slot lead=%s", lead_id)
+    try:
+        lead_repo.append_message(
+            lead_id,
+            "tool",
+            f"book_slot {parsed.isoformat()} slot={slot_key}",
+        )
+    except Exception:
+        logger.exception("Falha ao registrar mensagem de book_slot lead=%s", lead_id)
+    _label_lead_chat(lead_id, "agendado")
+
+    slot_label = lead_repo.SLOT_LABELS[slot_key]
+    slot_label_human = slot_label.lstrip("0") if slot_label.startswith("0") else slot_label
+    date_human = parsed.strftime("%d/%m/%Y")
+    date_short = parsed.strftime("%d/%m")
+    tell_client = (
+        f"Prontinho! Agendamento marcado pra {date_short} das {slot_label_human}. "
+        "Nossa equipe confirma qual técnico vai atender até amanhã. "
+        "Qualquer coisa te aviso por aqui!"
+    )
+    return {
+        "status": "ok",
+        "appointment_id": str(appt.get("id")),
+        "date": date_human,
+        "slot": slot_key,
+        "slot_label": slot_label,
+        "tell_client": tell_client,
+        "requires_team_assignment": True,
+    }
