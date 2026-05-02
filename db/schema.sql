@@ -51,6 +51,7 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS longitude NUMERIC(10, 7);
 
 CREATE INDEX IF NOT EXISTS leads_stage_idx ON leads (stage);
 CREATE INDEX IF NOT EXISTS leads_quote_sent_idx ON leads (quote_sent_at) WHERE quote_sent_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leads_bot_paused_idx ON leads (bot_paused) WHERE bot_paused = true;
 
 CREATE TABLE IF NOT EXISTS messages (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
