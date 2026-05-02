@@ -42,6 +42,8 @@ ALLOWED_LEAD_FIELDS = frozenset(
         "quoted_amount",
         "quote_notes",
         "equipe_responsavel",
+        "latitude",
+        "longitude",
     }
 )
 
@@ -460,6 +462,8 @@ def save_lead_field(lead_id: uuid.UUID, field_name: str, value: Any) -> dict[str
             py_val: Any = None
         else:
             py_val = Decimal(str(value))
+    elif field_name in ("latitude", "longitude"):
+        py_val = Decimal(str(value)) if value is not None and value != "" else None
     elif field_name == "btus" or field_name == "floor_level":
         py_val = int(value) if value is not None else None
     else:
@@ -470,6 +474,34 @@ def save_lead_field(lead_id: uuid.UUID, field_name: str, value: Any) -> dict[str
             cur.execute(
                 f"UPDATE leads SET {col} = %s, updated_at = now() WHERE id = %s RETURNING *",
                 (py_val, str(lead_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Lead não encontrado")
+            return dict(row)
+
+
+def save_lead_location(
+    lead_id: uuid.UUID,
+    latitude: float | str | Decimal,
+    longitude: float | str | Decimal,
+) -> dict[str, Any]:
+    """
+    FIX-MAPS: persiste latitude + longitude de uma vez como source of truth
+    da localização enviada pelo cliente via pin do WhatsApp (message.type=location).
+    """
+    lat = Decimal(str(latitude))
+    lng = Decimal(str(longitude))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET latitude = %s, longitude = %s, updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (lat, lng, str(lead_id)),
             )
             row = cur.fetchone()
             if not row:

@@ -44,6 +44,11 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_paused_reason TEXT;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_reactivated_at TIMESTAMPTZ;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_reactivated_by TEXT;
 
+-- FIX-MAPS: lat/lng são fonte da verdade da localização (pin enviado pelo cliente).
+-- Texto de endereço vira opcional/fallback. NUMERIC com precisão para coordenadas GPS.
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS latitude NUMERIC(10, 7);
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS longitude NUMERIC(10, 7);
+
 CREATE INDEX IF NOT EXISTS leads_stage_idx ON leads (stage);
 CREATE INDEX IF NOT EXISTS leads_quote_sent_idx ON leads (quote_sent_at) WHERE quote_sent_at IS NOT NULL;
 
@@ -70,6 +75,20 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 
 CREATE INDEX IF NOT EXISTS appointments_lead_idx ON appointments (lead_id);
+
+-- F2+A4: engine de agendamento com slots fixos.
+-- slot_enum: morning_early (8-10), morning_late (10-12),
+-- afternoon_early (14-16), afternoon_late (16-18).
+-- status novo: pending_team_assignment (humano atribui equipe depois).
+-- DESIGN DECISION: mantemos window_label como string legado + scheduled_date/slot estruturados.
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS scheduled_date DATE;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS slot TEXT;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS team_id TEXT;
+
+CREATE INDEX IF NOT EXISTS appointments_date_slot_idx
+    ON appointments (scheduled_date, slot)
+    WHERE scheduled_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS appointments_status_idx ON appointments (status);
 
 -- Fila de automações: idempotency_key UNIQUE evita WhatsApp/Telegram duplicado ao reprocessar.
 CREATE TABLE IF NOT EXISTS automation_jobs (

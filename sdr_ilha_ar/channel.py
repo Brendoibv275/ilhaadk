@@ -211,16 +211,127 @@ def _looks_like_address(text: str) -> bool:
 
 
 def _maybe_autosave_address(*, phone: str, text: str, external_channel: str) -> None:
+    """
+    FIX-MAPS: NÃO autosalvamos mais endereço por texto livre como source of truth.
+    O endereço-texto só é gravado se ainda não houver NENHUM dado de endereço
+    (nem lat/lng nem address), e fica como fallback. A source of truth agora é
+    o pin de localização (lat/lng) — ver `_persist_inbound_location`.
+    """
     if not _looks_like_address(text):
         return
     try:
         lead_id = lead_repo.ensure_lead(external_channel, phone, touch_inbound=True)
         lead = lead_repo.get_lead(lead_id) or {}
-        if not str(lead.get("address") or "").strip():
-            lead_repo.save_lead_field(lead_id, "address", text.strip())
-            lead_repo.append_message(lead_id, "tool", "autosave address from inbound text")
+        has_coords = lead.get("latitude") is not None and lead.get("longitude") is not None
+        has_address = bool(str(lead.get("address") or "").strip())
+        if has_coords or has_address:
+            return
+        # DESIGN DECISION: ainda salvamos texto como fallback, mas marcamos no log
+        # para deixar claro que é fallback. O prompt pede pin depois.
+        lead_repo.save_lead_field(lead_id, "address", text.strip())
+        lead_repo.append_message(
+            lead_id,
+            "tool",
+            "autosave address fallback (texto livre) — pin de localização ainda não enviado",
+        )
     except Exception:
         logger.exception("Falha ao autosalvar endereço para phone=%s", phone)
+
+
+def _persist_inbound_location(
+    *,
+    phone: str,
+    external_channel: str,
+    location: dict[str, Any],
+) -> None:
+    """
+    FIX-MAPS: quando o cliente manda um pin (message.type=location), gravamos
+    lat/lng como source of truth da localização. Se vier `address` no payload
+    da própria mensagem (Google Places às vezes preenche), só grava se não
+    houver address ainda salvo.
+    """
+    if not location:
+        return
+    try:
+        lat = location.get("latitude")
+        lng = location.get("longitude")
+        if lat is None or lng is None:
+            return
+        lead_id = lead_repo.ensure_lead(external_channel, phone, touch_inbound=True)
+        lead_repo.save_lead_location(lead_id, lat, lng)
+        lead = lead_repo.get_lead(lead_id) or {}
+        # Se vier nome/endereço no pin e não houver address salvo, usa como fallback humano.
+        loc_address = (location.get("name") or "") + (
+            (", " + location.get("address")) if location.get("address") else ""
+        )
+        loc_address = loc_address.strip(", ")
+        if loc_address and not str(lead.get("address") or "").strip():
+            lead_repo.save_lead_field(lead_id, "address", loc_address)
+        lead_repo.append_message(
+            lead_id,
+            "tool",
+            f"FIX-MAPS: location pin salvo lat={lat} lng={lng} name={location.get('name')!r}",
+        )
+    except Exception:
+        logger.exception("Falha ao persistir location inbound para phone=%s", phone)
+
+
+def _extract_location_payload(message: dict[str, Any], data: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """
+    FIX-MAPS: extrai latitude/longitude de mensagens WhatsApp do tipo location.
+    Suporta Evolution API (locationMessage) e variantes.
+    Retorna dict com {"latitude": float, "longitude": float, "name": str, "address": str}
+    ou dict vazio se não for location.
+    """
+    def _from_obj(obj: Any) -> dict[str, Any]:
+        if not isinstance(obj, dict):
+            return {}
+        lat = obj.get("degreesLatitude") or obj.get("latitude") or obj.get("lat")
+        lng = obj.get("degreesLongitude") or obj.get("longitude") or obj.get("lng") or obj.get("lon")
+        try:
+            if lat is not None and lng is not None:
+                return {
+                    "latitude": float(lat),
+                    "longitude": float(lng),
+                    "name": str(obj.get("name") or obj.get("locationName") or "").strip(),
+                    "address": str(obj.get("address") or "").strip(),
+                }
+        except (TypeError, ValueError):
+            return {}
+        return {}
+
+    # Estruturas comuns Evolution / Baileys
+    for key in ("locationMessage", "liveLocationMessage", "location"):
+        hit = _from_obj(message.get(key))
+        if hit:
+            return hit
+        # Dentro de ephemeralMessage ou viewOnceMessage
+        for wrapper_key in ("ephemeralMessage", "viewOnceMessage"):
+            wrapper = message.get(wrapper_key)
+            if isinstance(wrapper, dict):
+                inner = wrapper.get("message") if isinstance(wrapper.get("message"), dict) else wrapper
+                hit_inner = _from_obj(inner.get(key) if isinstance(inner, dict) else None)
+                if hit_inner:
+                    return hit_inner
+
+    # Top-level em data/body (alguns provedores)
+    for obj in (data, body):
+        hit = _from_obj(obj.get("location") if isinstance(obj, dict) else None)
+        if hit:
+            return hit
+        # Campos soltos data.latitude + data.longitude
+        if isinstance(obj, dict):
+            hit_flat = _from_obj(obj)
+            if hit_flat:
+                return hit_flat
+    return {}
+
+
+def _has_location_by_shape(*, data: dict[str, Any], body: dict[str, Any]) -> bool:
+    msg_type = str(data.get("messageType") or body.get("messageType") or "").strip().lower()
+    if "location" in msg_type:
+        return True
+    return False
 
 
 def _extract_audio_payload(message: dict[str, Any]) -> dict[str, Any]:
@@ -367,6 +478,10 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         # placeholders do provedor como texto real do cliente.
         text = ""
 
+    # FIX-MAPS: detectar pin de localização do WhatsApp.
+    location = _extract_location_payload(message, data, body)
+    has_location = bool(location) or _has_location_by_shape(data=data, body=body)
+
     return {
         "external_user_id": phone,
         "raw_remote_jid": remote_jid,
@@ -379,6 +494,8 @@ def parse_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         "audio_b64": audio_b64,
         "mime_type": mime_type,
         "has_audio": has_audio,
+        "location": location,
+        "has_location": has_location,
     }
 
 
@@ -400,12 +517,29 @@ async def handle_evolution_inbound(body: dict[str, Any]) -> dict[str, Any]:
         pre_name=str(parsed.get("pre_name") or "").strip(),
         external_channel=str(parsed["external_channel"]),
     )
+    # FIX-MAPS: se veio pin de localização, grava lat/lng ANTES do agente rodar
+    # e substitui texto por um marcador estruturado para o LLM reconhecer.
+    location = parsed.get("location") or {}
+    if location and location.get("latitude") is not None and location.get("longitude") is not None:
+        _persist_inbound_location(
+            phone=phone,
+            external_channel=str(parsed["external_channel"]),
+            location=location,
+        )
     _maybe_autosave_address(
         phone=phone,
         text=str(parsed.get("text") or ""),
         external_channel=str(parsed["external_channel"]),
     )
     text = parsed["text"]
+    # Se veio location e não veio texto, injeta texto sintético para o agente
+    # continuar o fluxo naturalmente.
+    if location and not text:
+        text = (
+            f"[LOCATION_RECEIVED lat={location['latitude']} lng={location['longitude']}"
+            + (f" name={location.get('name')!r}" if location.get("name") else "")
+            + "] Cliente enviou o pin de localização pelo WhatsApp."
+        )
     if not text:
         try:
             if parsed["audio_b64"]:
