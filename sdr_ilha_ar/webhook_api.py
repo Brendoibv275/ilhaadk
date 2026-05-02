@@ -695,6 +695,16 @@ def _enqueue_payload(
     pending.task = asyncio.create_task(_process_pending(conversation_key))
 
 
+def _is_business_hours_sl(ref: datetime | None = None) -> bool:
+    """
+    I/4 — Retorna True se o horário em São Luís/SP (UTC-3, sem DST) está entre
+    8h e 18h. Extraído como função pra facilitar testes (pode ser monkeypatch).
+    """
+    moment = ref or datetime.now(timezone.utc)
+    sl_hour = (moment.astimezone(timezone(timedelta(hours=-3)))).hour
+    return 8 <= sl_hour < 18
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     """
@@ -743,8 +753,7 @@ async def health() -> dict[str, Any]:
         time_since = max(0.0, (now - last_received).total_seconds())
 
     # Horário comercial São Luís / São Paulo (UTC-3).
-    sl_hour = (now.astimezone(timezone(timedelta(hours=-3)))).hour
-    business_hours = 8 <= sl_hour < 18
+    business_hours = _is_business_hours_sl(now)
 
     status = "ok"
     if (
