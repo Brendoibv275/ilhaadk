@@ -29,6 +29,9 @@ def _ensure_google_adk_stub() -> None:
     try:
         import google.adk.tools  # noqa: F401
         import google.adk.agents  # noqa: F401
+        import google.adk.runners  # noqa: F401
+        import google.genai  # noqa: F401
+        import google.genai.types  # noqa: F401
         return
     except Exception:
         pass
@@ -37,6 +40,9 @@ def _ensure_google_adk_stub() -> None:
     adk_mod = types.ModuleType("google.adk")
     tools_mod = types.ModuleType("google.adk.tools")
     agents_mod = types.ModuleType("google.adk.agents")
+    runners_mod = types.ModuleType("google.adk.runners")
+    genai_mod = types.ModuleType("google.genai")
+    genai_types_mod = types.ModuleType("google.genai.types")
 
     class ToolContext:  # pragma: no cover
         pass
@@ -46,16 +52,33 @@ def _ensure_google_adk_stub() -> None:
             self.args = args
             self.kwargs = kwargs
 
+    class InMemoryRunner:  # pragma: no cover
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    class Client:  # pragma: no cover
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
     tools_mod.ToolContext = ToolContext
     agents_mod.Agent = Agent
+    runners_mod.InMemoryRunner = InMemoryRunner
+    genai_mod.Client = Client
+    genai_mod.types = genai_types_mod
     adk_mod.tools = tools_mod
     adk_mod.agents = agents_mod
+    adk_mod.runners = runners_mod
     google_mod.adk = adk_mod
+    google_mod.genai = genai_mod
 
     sys.modules.setdefault("google", google_mod)
     sys.modules["google.adk"] = adk_mod
     sys.modules["google.adk.tools"] = tools_mod
     sys.modules["google.adk.agents"] = agents_mod
+    sys.modules["google.adk.runners"] = runners_mod
+    sys.modules["google.genai"] = genai_mod
+    sys.modules["google.genai.types"] = genai_types_mod
 
 
 def _ensure_psycopg_stub() -> None:
@@ -78,6 +101,9 @@ def _ensure_psycopg_stub() -> None:
     class OperationalError(Exception):  # pragma: no cover
         pass
 
+    class ProgrammingError(Exception):  # pragma: no cover
+        pass
+
     def connect(*args, **kwargs):  # pragma: no cover
         raise OperationalError("psycopg stub — DB não disponível nos testes")
 
@@ -90,6 +116,7 @@ def _ensure_psycopg_stub() -> None:
 
     psycopg_mod.Connection = Connection
     psycopg_mod.OperationalError = OperationalError
+    psycopg_mod.ProgrammingError = ProgrammingError
     psycopg_mod.connect = connect
     psycopg_mod.rows = rows_mod
     psycopg_mod.types = types_mod
