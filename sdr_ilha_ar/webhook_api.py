@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from datetime import date as date_cls
+
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import psycopg
 import requests
 
@@ -703,5 +706,193 @@ async def reactivate_lead_bot(lead_id: str) -> dict[str, Any]:
         "bot_paused": bool(row.get("bot_paused")),
         "bot_reactivated_at": row.get("bot_reactivated_at"),
         "bot_reactivated_by": row.get("bot_reactivated_by"),
+    }
+
+
+# =============================================================================
+# F5+A5 — endpoints de gestão de appointment (painel / frontend)
+# =============================================================================
+
+
+class _ConfirmBody(BaseModel):
+    team_id: str | None = None
+
+
+class _ReallocBody(BaseModel):
+    # Data no formato DD/MM/AAAA para bater com o resto do sistema.
+    new_date: str
+    new_slot: str
+
+
+class _CancelBody(BaseModel):
+    reason: str | None = None
+
+
+def _parse_br_date(value: str) -> date_cls:
+    try:
+        return datetime.strptime(str(value or "").strip(), "%d/%m/%Y").date()
+    except Exception as exc:  # pragma: no cover - caminho de erro simples
+        raise HTTPException(
+            status_code=400,
+            detail="Data inválida — use DD/MM/AAAA (ex: 05/05/2026).",
+        ) from exc
+
+
+def _format_scheduled_date(value: Any) -> str:
+    """Devolve a data do appointment formatada DD/MM/AAAA para mensagens."""
+    if value is None:
+        return ""
+    if isinstance(value, date_cls):
+        return value.strftime("%d/%m/%Y")
+    text = str(value).strip()
+    # Postgres devolve 'YYYY-MM-DD' via _jsonify_value — convertemos aqui.
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().strftime("%d/%m/%Y")
+    except Exception:
+        return text
+
+
+def _lead_first_name(appt: dict[str, Any]) -> str:
+    raw = str(appt.get("display_name") or "").strip()
+    if not raw:
+        return ""
+    return raw.split()[0]
+
+
+def _build_confirm_message(appt: dict[str, Any], team_id: str | None) -> str:
+    slot_label = repo.SLOT_LABELS.get(str(appt.get("slot") or ""), str(appt.get("slot") or ""))
+    data = _format_scheduled_date(appt.get("scheduled_date"))
+    if team_id:
+        return (
+            f"✅ Confirmado pra {data} das {slot_label}! "
+            f"A equipe {team_id} vai te atender — te aviso quando saírem pra aí."
+        )
+    return (
+        f"✅ Seu agendamento foi confirmado pra {data} das {slot_label}! "
+        "A equipe técnica vai te avisar no dia quando sair pra aí."
+    )
+
+
+def _build_realloc_message(appt: dict[str, Any]) -> str:
+    nome = _lead_first_name(appt)
+    saudacao = f"Oi {nome}!" if nome else "Oi!"
+    slot_label = repo.SLOT_LABELS.get(str(appt.get("slot") or ""), str(appt.get("slot") or ""))
+    data = _format_scheduled_date(appt.get("scheduled_date"))
+    return (
+        f"{saudacao} Precisamos ajustar seu agendamento pra {data} das {slot_label}. "
+        "Tudo bem? (responde SIM ou NÃO)"
+    )
+
+
+def _build_cancel_message(appt: dict[str, Any], reason: str | None) -> str:
+    nome = _lead_first_name(appt)
+    saudacao = f"Oi {nome}," if nome else "Oi,"
+    motivo = ""
+    if reason and str(reason).strip():
+        motivo = f" ({str(reason).strip()})"
+    return (
+        f"{saudacao} precisei cancelar seu agendamento{motivo}. "
+        "Se quiser remarcar, é só me chamar aqui."
+    )
+
+
+def _load_appointment_or_404(appointment_id: str) -> tuple[uuid.UUID, dict[str, Any]]:
+    try:
+        aid = uuid.UUID(appointment_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="appointment_id inválido") from exc
+    existing = repo.get_appointment(aid)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Appointment não encontrado")
+    return aid, existing
+
+
+@app.post("/appointments/{appointment_id}/confirm")
+async def confirm_appointment(
+    appointment_id: str,
+    body: _ConfirmBody | None = None,
+) -> dict[str, Any]:
+    body = body or _ConfirmBody()
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    team_id = (body.team_id or "").strip() or None
+    try:
+        updated = repo.update_appointment_status(
+            aid,
+            status="confirmed",
+            team_id=team_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Carrega versão enriquecida (com dados do lead) para montar a mensagem.
+    enriched = repo.get_appointment(aid) or {**_existing, **updated}
+    message = _build_confirm_message(enriched, team_id)
+    # DESIGN DECISION: envio automático ao WhatsApp entra no próximo commit
+    # (D/2) para manter o diff focado em contrato HTTP + update de status.
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "message_sent": message,
+    }
+
+
+@app.post("/appointments/{appointment_id}/realloc")
+async def realloc_appointment(
+    appointment_id: str,
+    body: _ReallocBody,
+) -> dict[str, Any]:
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    new_date = _parse_br_date(body.new_date)
+    new_slot = str(body.new_slot or "").strip()
+    if new_slot not in repo.SLOT_LABELS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Slot inválido: {new_slot}. "
+                f"Use um de {list(repo.SLOT_LABELS)}."
+            ),
+        )
+    try:
+        updated = repo.update_appointment_status(
+            aid,
+            status="realloc",
+            scheduled_date=new_date,
+            slot=new_slot,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    enriched = repo.get_appointment(aid) or {**_existing, **updated}
+    message = _build_realloc_message(enriched)
+    # DESIGN DECISION: envio ao WhatsApp entra em D/2.
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "message_sent": message,
+    }
+
+
+@app.post("/appointments/{appointment_id}/cancel")
+async def cancel_appointment(
+    appointment_id: str,
+    body: _CancelBody | None = None,
+) -> dict[str, Any]:
+    body = body or _CancelBody()
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    try:
+        updated = repo.update_appointment_status(aid, status="cancelled")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    enriched = repo.get_appointment(aid) or {**_existing, **updated}
+    message = _build_cancel_message(enriched, body.reason)
+    # DESIGN DECISION: envio ao WhatsApp entra em D/2.
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "message_sent": message,
     }
 
