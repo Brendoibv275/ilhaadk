@@ -13,6 +13,8 @@ from google.adk.agents import Agent
 
 from sdr_ilha_ar.prompts import INSTRUCTION
 from sdr_ilha_ar.tools_impl import (
+    book_slot,
+    check_availability,
     enqueue_automation_job,
     get_current_datetime,
     get_lead_status,
@@ -39,5 +41,7 @@ root_agent = Agent(
         request_human_handoff,
         mark_quote_sent,
         register_appointment_request,
+        check_availability,
+        book_slot,
     ],
 )

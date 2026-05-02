@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import time
@@ -42,6 +42,8 @@ ALLOWED_LEAD_FIELDS = frozenset(
         "quoted_amount",
         "quote_notes",
         "equipe_responsavel",
+        "latitude",
+        "longitude",
     }
 )
 
@@ -354,6 +356,30 @@ def is_bot_paused(lead_id: uuid.UUID) -> bool:
     return bool(lead.get("bot_paused"))
 
 
+def pause_bot_for_lead(
+    lead_id: uuid.UUID,
+    *,
+    reason: str = "",
+    by: str = "system",
+) -> dict[str, Any]:
+    """Wrapper de alto nível: pausa o bot pra este lead.
+
+    Contrato amigável para os endpoints REST e detecção automática.
+    Internamente delega para `set_bot_paused` (que lida com os timestamps).
+    """
+    return set_bot_paused(lead_id, paused=True, by=by, reason=reason)
+
+
+def resume_bot_for_lead(
+    lead_id: uuid.UUID,
+    *,
+    by: str = "system",
+    reason: str = "manual_resume",
+) -> dict[str, Any]:
+    """Wrapper de alto nível: retoma o bot (espelho de `pause_bot_for_lead`)."""
+    return set_bot_paused(lead_id, paused=False, by=by, reason=reason)
+
+
 def set_bot_paused(
     lead_id: uuid.UUID,
     *,
@@ -460,6 +486,8 @@ def save_lead_field(lead_id: uuid.UUID, field_name: str, value: Any) -> dict[str
             py_val: Any = None
         else:
             py_val = Decimal(str(value))
+    elif field_name in ("latitude", "longitude"):
+        py_val = Decimal(str(value)) if value is not None and value != "" else None
     elif field_name == "btus" or field_name == "floor_level":
         py_val = int(value) if value is not None else None
     else:
@@ -470,6 +498,34 @@ def save_lead_field(lead_id: uuid.UUID, field_name: str, value: Any) -> dict[str
             cur.execute(
                 f"UPDATE leads SET {col} = %s, updated_at = now() WHERE id = %s RETURNING *",
                 (py_val, str(lead_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Lead não encontrado")
+            return dict(row)
+
+
+def save_lead_location(
+    lead_id: uuid.UUID,
+    latitude: float | str | Decimal,
+    longitude: float | str | Decimal,
+) -> dict[str, Any]:
+    """
+    FIX-MAPS: persiste latitude + longitude de uma vez como source of truth
+    da localização enviada pelo cliente via pin do WhatsApp (message.type=location).
+    """
+    lat = Decimal(str(latitude))
+    lng = Decimal(str(longitude))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET latitude = %s, longitude = %s, updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (lat, lng, str(lead_id)),
             )
             row = cur.fetchone()
             if not row:
@@ -497,7 +553,104 @@ def set_lead_stage(lead_id: uuid.UUID, new_stage: str) -> dict[str, Any]:
             )
             out = cur.fetchone()
             assert out is not None
+            # G: mantém histórico — fecha linha aberta anterior e insere nova.
+            # Só registra se realmente mudou de estágio.
+            if current != new_stage:
+                cur.execute(
+                    """
+                    UPDATE lead_stage_history
+                    SET exited_at = now()
+                    WHERE lead_id = %s AND exited_at IS NULL
+                    """,
+                    (str(lead_id),),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO lead_stage_history (lead_id, stage, entered_at)
+                    VALUES (%s, %s, now())
+                    """,
+                    (str(lead_id), new_stage),
+                )
             return dict(out)
+
+
+def get_current_stage_duration(lead_id: uuid.UUID) -> timedelta | None:
+    """Retorna timedelta desde o último entered_at do estágio atual (linha aberta).
+
+    Se não houver linha aberta em lead_stage_history, faz fallback para
+    max(entered_at) independente de exited_at. Se nada existir, retorna None.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entered_at FROM lead_stage_history
+                WHERE lead_id = %s AND exited_at IS NULL
+                ORDER BY entered_at DESC LIMIT 1
+                """,
+                (str(lead_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    """
+                    SELECT entered_at FROM lead_stage_history
+                    WHERE lead_id = %s
+                    ORDER BY entered_at DESC LIMIT 1
+                    """,
+                    (str(lead_id),),
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            entered_at = row["entered_at"]
+            now = datetime.now(timezone.utc)
+            if entered_at.tzinfo is None:
+                entered_at = entered_at.replace(tzinfo=timezone.utc)
+            return now - entered_at
+
+
+def get_stage_history(lead_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Retorna histórico de estágios do lead (ordem cronológica asc)."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, lead_id, stage, entered_at, exited_at
+                FROM lead_stage_history
+                WHERE lead_id = %s
+                ORDER BY entered_at ASC
+                """,
+                (str(lead_id),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_stage_duration_for(lead_id: uuid.UUID, stage: str) -> timedelta | None:
+    """Tempo desde o último entered_at do `stage` informado (aberto ou fechado).
+
+    Usado pelo worker de follow-up: calcula há quanto tempo o lead está (ou esteve)
+    em determinado estágio, ex: 'quoted'. Se houver linha aberta daquele stage,
+    usa-a; senão, usa a mais recente fechada.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entered_at FROM lead_stage_history
+                WHERE lead_id = %s AND stage = %s
+                ORDER BY entered_at DESC LIMIT 1
+                """,
+                (str(lead_id), stage),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            entered_at = row["entered_at"]
+            now = datetime.now(timezone.utc)
+            if entered_at.tzinfo is None:
+                entered_at = entered_at.replace(tzinfo=timezone.utc)
+            return now - entered_at
 
 
 def mark_quote_sent(lead_id: uuid.UUID) -> dict[str, Any]:
@@ -535,6 +688,82 @@ def append_message(
             row = cur.fetchone()
             assert row is not None
             return row["id"]
+
+
+# =============================================================================
+# I/1 — Idempotência de mensagens do WhatsApp (provider_message_id).
+# =============================================================================
+
+
+def register_processed_message(
+    provider_message_id: str,
+    lead_id: uuid.UUID | None = None,
+) -> bool:
+    """
+    Tenta registrar uma mensagem como processada.
+
+    Retorna True se foi inserida (mensagem NOVA) ou False se já existia
+    (duplicata — o webhook deve fazer skip). Usa INSERT ... ON CONFLICT DO
+    NOTHING pra atomicidade mesmo com webhooks chegando em paralelo.
+    """
+    key = str(provider_message_id or "").strip()
+    if not key:
+        return True  # sem id, processa normal (não tem como deduplicar)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO processed_messages (provider_message_id, lead_id)
+                VALUES (%s, %s)
+                ON CONFLICT (provider_message_id) DO NOTHING
+                RETURNING id
+                """,
+                (key, str(lead_id) if lead_id else None),
+            )
+            row = cur.fetchone()
+            return row is not None
+
+
+def mark_message_processed(provider_message_id: str) -> None:
+    """Marca `processed_at = now()` para o provider_message_id (best-effort)."""
+    key = str(provider_message_id or "").strip()
+    if not key:
+        return
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processed_messages
+                SET processed_at = now()
+                WHERE provider_message_id = %s
+                """,
+                (key,),
+            )
+
+
+def get_last_processed_message_times() -> dict[str, Any]:
+    """
+    Retorna dict com last_received_at / last_processed_at para o endpoint /health.
+    Faz fallback seguro (None) se a tabela ainda não existir.
+    """
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT MAX(received_at) AS last_received_at,
+                           MAX(processed_at) AS last_processed_at
+                      FROM processed_messages
+                    """
+                )
+                row = cur.fetchone() or {}
+                return {
+                    "last_received_at": row.get("last_received_at"),
+                    "last_processed_at": row.get("last_processed_at"),
+                }
+    except Exception:
+        logger.exception("get_last_processed_message_times: falha consultando processed_messages")
+        return {"last_received_at": None, "last_processed_at": None}
 
 
 def enqueue_job(
@@ -681,6 +910,206 @@ def create_appointment(
             row = cur.fetchone()
             assert row is not None
             return row["id"]
+
+
+# =============================================================================
+# F2+A4: Engine de agendamento com slots fixos
+# =============================================================================
+# Slots fixos do dia e rótulos usados no texto ao cliente / resumo interno.
+SLOT_LABELS: dict[str, str] = {
+    "morning_early": "08h-10h",
+    "morning_late": "10h-12h",
+    "afternoon_early": "14h-16h",
+    "afternoon_late": "16h-18h",
+}
+SLOTS_ORDER: tuple[str, ...] = (
+    "morning_early",
+    "morning_late",
+    "afternoon_early",
+    "afternoon_late",
+)
+# Limite diário por equipe (4 slots = 1 equipe saturada).
+# DESIGN DECISION: por enquanto tratamos "equipe única" e bloqueamos o slot se
+# já houver 1 appointment ativo nele. Quando adicionarmos mais equipes, bastará
+# contar por (date, slot, team_id).
+APPOINTMENT_ACTIVE_STATUSES: tuple[str, ...] = (
+    "pending_team_assignment",
+    "proposed",
+    "confirmed",
+    "realloc",
+)
+
+
+def list_appointments_for_date(appointment_date: date) -> list[dict[str, Any]]:
+    """Retorna appointments ATIVOS (não cancelados/concluídos) em uma data."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, lead_id, scheduled_date, slot, team_id, status,
+                       window_label, notes, created_at
+                FROM appointments
+                WHERE scheduled_date = %s
+                  AND status = ANY(%s)
+                ORDER BY slot ASC, created_at ASC
+                """,
+                (appointment_date, list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
+
+
+def check_slot_availability(appointment_date: date) -> dict[str, bool]:
+    """Retorna dict {slot_name: livre?} para a data informada."""
+    taken = {row["slot"] for row in list_appointments_for_date(appointment_date) if row.get("slot")}
+    return {slot: (slot not in taken) for slot in SLOTS_ORDER}
+
+
+def create_slot_appointment(
+    lead_id: uuid.UUID,
+    *,
+    appointment_date: date,
+    slot: str,
+    notes: str = "",
+    window_label: str = "",
+) -> dict[str, Any]:
+    """
+    Cria appointment estruturado (slot + date) com status pending_team_assignment.
+    Valida limite 4/dia (DESIGN DECISION: 1 equipe = 4 slots únicos).
+    Retorna dict com o appointment criado.
+    """
+    if slot not in SLOT_LABELS:
+        raise ValueError(f"Slot inválido: {slot}. Use um de {list(SLOT_LABELS)}.")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM appointments
+                WHERE scheduled_date = %s
+                  AND slot = %s
+                  AND status = ANY(%s)
+                """,
+                (appointment_date, slot, list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            row = cur.fetchone() or {}
+            if int(row.get("total") or 0) >= 1:
+                raise ValueError(
+                    f"Slot {slot} em {appointment_date.isoformat()} já está ocupado."
+                )
+            # Limite de 4/dia (redundância defensiva caso introduzamos >1 slot por período no futuro).
+            cur.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM appointments
+                WHERE scheduled_date = %s
+                  AND status = ANY(%s)
+                """,
+                (appointment_date, list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            row_day = cur.fetchone() or {}
+            if int(row_day.get("total") or 0) >= 4:
+                raise ValueError(
+                    f"Dia {appointment_date.isoformat()} já está com 4 atendimentos."
+                )
+            label = window_label or f"{appointment_date.strftime('%d/%m/%Y')} {SLOT_LABELS[slot]}"
+            cur.execute(
+                """
+                INSERT INTO appointments (
+                    lead_id, window_label, status, scheduled_date, slot, notes
+                )
+                VALUES (%s, %s, 'pending_team_assignment', %s, %s, %s)
+                RETURNING id, lead_id, scheduled_date, slot, team_id, status,
+                          window_label, notes, created_at
+                """,
+                (str(lead_id), label, appointment_date, slot, notes or None),
+            )
+            row_out = cur.fetchone()
+            assert row_out is not None
+            return {k: _jsonify_value(v) for k, v in row_out.items()}
+
+
+def list_active_appointments_for_lead(lead_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Retorna appointments ATIVOS (não cancelados/concluídos) de um lead.
+
+    Usado pelo follow-up de recall 6m pra pular leads que já têm novo agendamento
+    em andamento — evita mensagem de oferta colidir com atendimento vigente.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM appointments
+                WHERE lead_id = %s AND status = ANY(%s)
+                ORDER BY created_at DESC
+                """,
+                (str(lead_id), list(APPOINTMENT_ACTIVE_STATUSES)),
+            )
+            return _jsonify_rows([dict(r) for r in cur.fetchall()])
+
+
+def get_appointment(appointment_id: uuid.UUID) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.*, l.display_name, l.phone, l.external_user_id,
+                       l.external_channel, l.address, l.latitude, l.longitude,
+                       l.service_type, l.quoted_amount
+                FROM appointments a
+                JOIN leads l ON l.id = a.lead_id
+                WHERE a.id = %s
+                """,
+                (str(appointment_id),),
+            )
+            row = cur.fetchone()
+            return {k: _jsonify_value(v) for k, v in row.items()} if row else None
+
+
+def update_appointment_status(
+    appointment_id: uuid.UUID,
+    *,
+    status: str,
+    team_id: str | None = None,
+    scheduled_date: date | None = None,
+    slot: str | None = None,
+) -> dict[str, Any]:
+    """Atualiza status / equipe / data / slot de um appointment."""
+    allowed_status = {
+        "pending_team_assignment",
+        "proposed",
+        "confirmed",
+        "realloc",
+        "cancelled",
+        "done",
+        "completed",
+    }
+    if status not in allowed_status:
+        raise ValueError(f"Status inválido: {status}")
+    sets = ["status = %s"]
+    params: list[Any] = [status]
+    if team_id is not None:
+        sets.append("team_id = %s")
+        params.append(team_id)
+    if scheduled_date is not None:
+        sets.append("scheduled_date = %s")
+        params.append(scheduled_date)
+    if slot is not None:
+        if slot not in SLOT_LABELS:
+            raise ValueError(f"Slot inválido: {slot}")
+        sets.append("slot = %s")
+        params.append(slot)
+    sets.append("updated_at = now()")
+    params.append(str(appointment_id))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE appointments SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                tuple(params),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise LookupError("Appointment não encontrado")
+            return {k: _jsonify_value(v) for k, v in row.items()}
 
 
 def mark_lead_completed(lead_id: uuid.UUID) -> dict[str, Any]:

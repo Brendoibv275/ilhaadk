@@ -6,11 +6,14 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from datetime import date as date_cls
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import psycopg
 import requests
 
@@ -19,7 +22,13 @@ from sdr_ilha_ar import repository as repo
 
 app = FastAPI(title="SDR Ilha Ar Webhook API", version="1.0.0")
 logger = logging.getLogger(__name__)
-DEBOUNCE_SECONDS = 12
+# I/2 — Inbox único com debounce de 20s.
+# Mensagens do mesmo lead (mesma conversation_key) que chegam dentro dessa
+# janela são agregadas numa única chamada ao LLM, evitando múltiplas respostas
+# quando o cliente manda "oi", "tudo bem?", "preciso de orçamento" em poucos
+# segundos. Implementação em memória (asyncio.Task por conversa) — funciona
+# com uma réplica; pra escalar horizontal troca pra Redis/Postgres.
+DEBOUNCE_SECONDS = 20
 
 
 @app.exception_handler(psycopg.ProgrammingError)
@@ -51,6 +60,11 @@ class PendingConversation:
 _pending_by_phone: dict[str, PendingConversation] = {}
 _handoff_cache: dict[str, bool] = {}
 
+# I/4 — Healthcheck: trackeamos o último inbound/processamento em memória pra
+# complementar o banco (que pode não estar acessível no momento do /health).
+_last_inbound_received_at: datetime | None = None
+_last_inbound_processed_at: datetime | None = None
+
 
 def _resolve_external_channel(evolution_instance: str = "") -> str:
     # Operação single-instance: canal único para todos os leads.
@@ -70,6 +84,29 @@ def _is_allowed_instance(inbound_instance: str) -> bool:
     if not incoming:
         return False
     return incoming == configured
+
+
+def _extract_provider_message_id(payload: dict[str, Any]) -> str:
+    """
+    I/1 — Extrai o provider_message_id do payload Evolution/Meta.
+    Retorna string vazia se não encontrar (fallback: processa normal).
+    """
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(data, dict):
+        key = data.get("key") if isinstance(data.get("key"), dict) else {}
+        for candidate in (
+            key.get("id") if isinstance(key, dict) else None,
+            data.get("id"),
+            data.get("messageId"),
+            data.get("message_id"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    # Top-level (Meta Cloud etc.)
+    for candidate in (payload.get("id"), payload.get("messageId")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
 
 
 def _truthy(v: Any) -> bool:
@@ -292,6 +329,76 @@ def _build_evolution_number_candidates(*, remote_jid: str, phone: str) -> list[s
     return out
 
 
+def _is_retriable_network_error(exc: Exception) -> bool:
+    """
+    I/3 — Classifica exceções que devem ser retentadas no envio WhatsApp.
+    Consideramos retriável: ConnectionError, Timeout, e HTTPError com status 5xx.
+    Erros 4xx (payload ruim, número inválido) não são retentados.
+    """
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        return bool(status is not None and 500 <= int(status) < 600)
+    return False
+
+
+def _retry_network_call(
+    func,
+    *args,
+    max_attempts: int = 3,
+    backoff_seconds: tuple[float, ...] = (1.0, 4.0, 16.0),
+    op_name: str = "network_call",
+    **kwargs,
+):
+    """
+    I/3 — Executa `func(*args, **kwargs)` com retry exponencial em erros de
+    rede. Tenta até `max_attempts` vezes, dormindo `backoff_seconds[i]` antes
+    da próxima tentativa. Só retenta em erros classificados como retriáveis.
+    Loga estruturadamente cada retry.
+    """
+    import time
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            retriable = _is_retriable_network_error(exc)
+            if not retriable or attempt >= max_attempts:
+                logger.warning(
+                    "I/3 retry: %s falhou definitivamente attempt=%s/%s retriable=%s erro=%s",
+                    op_name,
+                    attempt,
+                    max_attempts,
+                    retriable,
+                    exc,
+                )
+                raise
+            delay = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            logger.warning(
+                "I/3 retry: %s attempt=%s/%s falhou (retriable=%s) — retry em %.1fs. erro=%s",
+                op_name,
+                attempt,
+                max_attempts,
+                retriable,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
+
+
+def _post_whatsapp_text(*, endpoint: str, headers: dict, payload: dict) -> requests.Response:
+    """I/3 — Wrapper que isola a chamada HTTP para ficar retentável."""
+    response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+    response.raise_for_status()
+    return response
+
+
 def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str, evolution_instance: str = "") -> None:
     base_url = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
     instance = str(evolution_instance or os.getenv("EVOLUTION_INSTANCE") or "").strip()
@@ -312,8 +419,14 @@ def _send_whatsapp_reply(*, remote_jid: str, phone: str, text: str, evolution_in
         for value in candidates:
             payload = {"number": value, "text": chunk}
             try:
-                response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
-                response.raise_for_status()
+                # I/3 — retry automático com backoff (1s, 4s, 16s) em erros de rede/5xx.
+                _retry_network_call(
+                    _post_whatsapp_text,
+                    endpoint=endpoint,
+                    headers=headers,
+                    payload=payload,
+                    op_name=f"whatsapp_send_text number={value}",
+                )
                 sent = True
                 break
             except Exception as exc:  # pragma: no cover - depende da API externa
@@ -473,6 +586,7 @@ async def _process_pending(conversation_key: str) -> None:
     remote_jid = pending.remote_jid
     external_channel = pending.external_channel
     evolution_instance = pending.evolution_instance
+    message_ids_processed = list(pending.message_ids)
     _pending_by_phone.pop(conversation_key, None)
     reply_to_send = ""
     must_reply_audio = False
@@ -526,6 +640,17 @@ async def _process_pending(conversation_key: str) -> None:
             evolution_instance=evolution_instance,
         )
 
+    # I/1 — marca processed_at no banco para cada provider_message_id do lote.
+    for pmid in message_ids_processed:
+        try:
+            repo.mark_message_processed(pmid)
+        except Exception:
+            logger.exception("I/1: falha ao marcar mensagem como processada pmid=%s", pmid)
+
+    # I/4 — Healthcheck: guarda última atividade processada.
+    global _last_inbound_processed_at
+    _last_inbound_processed_at = datetime.now(timezone.utc)
+
 
 def _enqueue_payload(
     *,
@@ -570,9 +695,90 @@ def _enqueue_payload(
     pending.task = asyncio.create_task(_process_pending(conversation_key))
 
 
+def _is_business_hours_sl(ref: datetime | None = None) -> bool:
+    """
+    I/4 — Retorna True se o horário em São Luís/SP (UTC-3, sem DST) está entre
+    8h e 18h. Extraído como função pra facilitar testes (pode ser monkeypatch).
+    """
+    moment = ref or datetime.now(timezone.utc)
+    sl_hour = (moment.astimezone(timezone(timedelta(hours=-3)))).hour
+    return 8 <= sl_hour < 18
+
+
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    """
+    I/4 — Healthcheck enriquecido.
+
+    Retorna:
+    - status: "ok" | "degraded" | "down"
+    - last_msg_received_at: ISO8601 | null  (último webhook aceito)
+    - last_msg_processed_at: ISO8601 | null (último LLM processou)
+    - workers_alive: int  (tasks de debounce pendentes, proxy de atividade)
+    - time_since_last_msg_seconds: float | null
+
+    Regra de "degraded": em horário comercial (8h-18h hora de São Luís/SP,
+    UTC-3), se já recebemos alguma mensagem e o último recebimento foi há
+    mais de 600s (10 min), consideramos degradado. Se nunca recebemos nada e
+    o servidor acabou de subir, status="ok".
+    """
+    now = datetime.now(timezone.utc)
+
+    # Preferência: dados em memória (mais frescos). Fallback: Postgres.
+    last_received: datetime | None = _last_inbound_received_at
+    last_processed: datetime | None = _last_inbound_processed_at
+
+    if last_received is None or last_processed is None:
+        try:
+            db_times = repo.get_last_processed_message_times()
+            if last_received is None:
+                last_received = db_times.get("last_received_at")
+            if last_processed is None:
+                last_processed = db_times.get("last_processed_at")
+        except Exception:
+            logger.exception("/health: falha ao consultar processed_messages")
+
+    def _aware(dt: Any) -> datetime | None:
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return None
+
+    last_received = _aware(last_received)
+    last_processed = _aware(last_processed)
+
+    time_since = None
+    if last_received is not None:
+        time_since = max(0.0, (now - last_received).total_seconds())
+
+    # Horário comercial São Luís / São Paulo (UTC-3).
+    business_hours = _is_business_hours_sl(now)
+
+    status = "ok"
+    if (
+        last_received is not None
+        and business_hours
+        and time_since is not None
+        and time_since > 600
+    ):
+        status = "degraded"
+
+    workers_alive = sum(
+        1 for p in _pending_by_phone.values() if p.task and not p.task.done()
+    )
+
+    def _iso(dt: datetime | None) -> str | None:
+        return dt.isoformat() if dt else None
+
+    return {
+        "status": status,
+        "last_msg_received_at": _iso(last_received),
+        "last_msg_processed_at": _iso(last_processed),
+        "workers_alive": workers_alive,
+        "time_since_last_msg_seconds": time_since,
+        "business_hours_sl": business_hours,
+    }
 
 
 @app.on_event("startup")
@@ -612,6 +818,33 @@ async def webhook_whatsapp(
             evolution_instance,
         )
         return {"status": "ignored", "reason": "instance_not_allowed"}
+
+    # I/1 — Idempotência: se esse provider_message_id já foi registrado, é
+    # retry/duplicata do provedor. Skip e loga.
+    provider_message_id = _extract_provider_message_id(payload)
+    if provider_message_id:
+        try:
+            inserted = repo.register_processed_message(provider_message_id)
+            if not inserted:
+                logger.info(
+                    "I/1: mensagem duplicada ignorada provider_id=%s phone=%s",
+                    provider_message_id,
+                    phone,
+                )
+                return {
+                    "status": "ignored",
+                    "reason": "duplicate_provider_message_id",
+                    "provider_message_id": provider_message_id,
+                }
+        except Exception:
+            logger.exception(
+                "I/1: falha ao checar idempotência (processed_messages) — seguindo fluxo"
+            )
+
+    # I/4 — Healthcheck: atualiza timestamp em memória (para /health).
+    global _last_inbound_received_at
+    _last_inbound_received_at = datetime.now(timezone.utc)
+
     external_channel = str(parsed.get("external_channel") or "").strip() or _resolve_external_channel(evolution_instance)
     conversation_key = f"{evolution_instance}|{(remote_jid or phone).strip()}"
     lead_id = _resolve_lead_id(phone, evolution_instance=evolution_instance) if phone else None
@@ -665,6 +898,16 @@ async def webhook_whatsapp(
         )
         return {"status": "queued", "delivery": "queued", "debounce_seconds": DEBOUNCE_SECONDS}
     result = await handle_evolution_inbound(payload)
+    # I/1: mesmo no caminho "skipped" (sem remote_jid/phone), marcamos
+    # processed_at se conseguimos identificar provider_message_id.
+    if provider_message_id:
+        try:
+            repo.mark_message_processed(provider_message_id)
+        except Exception:
+            logger.exception("I/1: falha ao marcar processed_at no caminho skipped")
+    # I/4: guarda tempo de processamento também no caminho skipped.
+    global _last_inbound_processed_at
+    _last_inbound_processed_at = datetime.now(timezone.utc)
     return {**result, "delivery": "skipped"}
 
 
@@ -686,6 +929,42 @@ async def get_lead_bot_status(lead_id: str) -> dict[str, Any]:
     }
 
 
+# =============================================================================
+# G — Informações de funil: estágio atual, duração, histórico.
+# =============================================================================
+
+
+@app.get("/leads/{lead_id}/stage-info")
+async def get_lead_stage_info(lead_id: str) -> dict[str, Any]:
+    """Retorna info de funil do lead: estágio atual, entered_at, duração (s) e histórico.
+
+    Usado pelo frontend pra renderizar badge "Em '{stage}' há {duration_human}".
+    """
+    lid = uuid.UUID(lead_id)
+    lead = repo.get_lead(lid)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead não encontrado")
+    history = repo.get_stage_history(lid)
+    duration = repo.get_current_stage_duration(lid)
+    # entered_at do estágio corrente = última entrada em history que bate com stage atual e está aberta.
+    entered_at = None
+    current_stage = lead.get("stage")
+    for row in reversed(history):
+        if row.get("stage") == current_stage and row.get("exited_at") is None:
+            entered_at = row.get("entered_at")
+            break
+    if entered_at is None and history:
+        # fallback: último registro (caso linha esteja fechada por algum motivo)
+        entered_at = history[-1].get("entered_at")
+    return {
+        "lead_id": str(lead["id"]),
+        "current_stage": current_stage,
+        "entered_at": entered_at,
+        "duration_seconds": int(duration.total_seconds()) if duration is not None else None,
+        "history": history,
+    }
+
+
 @app.post("/leads/{lead_id}/bot/reactivate")
 async def reactivate_lead_bot(lead_id: str) -> dict[str, Any]:
     lid = uuid.UUID(lead_id)
@@ -704,4 +983,359 @@ async def reactivate_lead_bot(lead_id: str) -> dict[str, Any]:
         "bot_reactivated_at": row.get("bot_reactivated_at"),
         "bot_reactivated_by": row.get("bot_reactivated_by"),
     }
+
+
+# =============================================================================
+# F — Endpoints canônicos de pausa/retomada (usados pelo frontend Parte F).
+# =============================================================================
+
+
+class _PauseBotBody(BaseModel):
+    reason: str | None = None
+    by: str | None = None
+
+
+@app.post("/leads/{lead_id}/pause-bot")
+async def pause_lead_bot(
+    lead_id: str,
+    body: _PauseBotBody | None = None,
+) -> dict[str, Any]:
+    lid = uuid.UUID(lead_id)
+    reason = (body.reason if body and body.reason else "manual_pause").strip() or "manual_pause"
+    by = (body.by if body and body.by else "frontend").strip() or "frontend"
+    row = repo.pause_bot_for_lead(lid, reason=reason, by=by)
+    # Sincroniza cache de handoff local (conversation_key contém external_user_id).
+    external_user_id = str(row.get("external_user_id") or "").strip()
+    if external_user_id:
+        for key in list(_handoff_cache.keys()):
+            if external_user_id in key:
+                _handoff_cache[key] = True
+    repo.append_message(
+        lead_id=lid,
+        role="tool",
+        body=f"Bot pausado manualmente via frontend (motivo={reason}).",
+        metadata={"event": "bot_paused_frontend", "reason": reason, "by": by},
+    )
+    return {
+        "status": "ok",
+        "lead_id": str(row["id"]),
+        "bot_paused": bool(row.get("bot_paused")),
+        "bot_paused_at": row.get("bot_paused_at"),
+        "bot_paused_by": row.get("bot_paused_by"),
+        "bot_paused_reason": row.get("bot_paused_reason"),
+    }
+
+
+@app.post("/leads/{lead_id}/resume-bot")
+async def resume_lead_bot(lead_id: str) -> dict[str, Any]:
+    """Alias canônico do /bot/reactivate, pedido pela Parte F."""
+    lid = uuid.UUID(lead_id)
+    row = repo.resume_bot_for_lead(lid, by="frontend", reason="manual_resume")
+    repo.append_message(
+        lead_id=lid,
+        role="tool",
+        body="Bot retomado manualmente via frontend.",
+        metadata={"event": "bot_resumed_frontend"},
+    )
+    _clear_handoff_pause_for_lead(row)
+    return {
+        "status": "ok",
+        "lead_id": str(row["id"]),
+        "bot_paused": bool(row.get("bot_paused")),
+        "bot_reactivated_at": row.get("bot_reactivated_at"),
+        "bot_reactivated_by": row.get("bot_reactivated_by"),
+    }
+
+
+# =============================================================================
+# F5+A5 — endpoints de gestão de appointment (painel / frontend)
+# =============================================================================
+
+
+class _ConfirmBody(BaseModel):
+    team_id: str | None = None
+
+
+class _ReallocBody(BaseModel):
+    # Data no formato DD/MM/AAAA para bater com o resto do sistema.
+    new_date: str
+    new_slot: str
+
+
+class _CancelBody(BaseModel):
+    reason: str | None = None
+
+
+def _parse_br_date(value: str) -> date_cls:
+    try:
+        return datetime.strptime(str(value or "").strip(), "%d/%m/%Y").date()
+    except Exception as exc:  # pragma: no cover - caminho de erro simples
+        raise HTTPException(
+            status_code=400,
+            detail="Data inválida — use DD/MM/AAAA (ex: 05/05/2026).",
+        ) from exc
+
+
+def _format_scheduled_date(value: Any) -> str:
+    """Devolve a data do appointment formatada DD/MM/AAAA para mensagens."""
+    if value is None:
+        return ""
+    if isinstance(value, date_cls):
+        return value.strftime("%d/%m/%Y")
+    text = str(value).strip()
+    # Postgres devolve 'YYYY-MM-DD' via _jsonify_value — convertemos aqui.
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().strftime("%d/%m/%Y")
+    except Exception:
+        return text
+
+
+def _lead_first_name(appt: dict[str, Any]) -> str:
+    raw = str(appt.get("display_name") or "").strip()
+    if not raw:
+        return ""
+    return raw.split()[0]
+
+
+def _notify_lead_whatsapp(appt: dict[str, Any], text: str) -> None:
+    """Envia mensagem de texto ao lead reusando o transporte Evolution.
+
+    Tolera falhas (ambiente sem credenciais, lead sem telefone) para não
+    derrubar o endpoint REST — o status do appointment já foi persistido.
+    """
+    phone = str(appt.get("phone") or "").strip()
+    remote_jid = str(appt.get("external_user_id") or "").strip()
+    if not (phone or remote_jid):
+        logger.warning(
+            "Appointment %s sem telefone/jid; pulei notificação ao lead.",
+            appt.get("id"),
+        )
+        return
+    try:
+        _send_whatsapp_reply(remote_jid=remote_jid, phone=phone, text=text)
+    except Exception:
+        logger.exception(
+            "Falha ao notificar lead (appointment=%s). Status já foi atualizado.",
+            appt.get("id"),
+        )
+    # Registra no histórico do lead independentemente do envio real.
+    lead_id = appt.get("lead_id")
+    if lead_id:
+        try:
+            repo.append_message(
+                lead_id=uuid.UUID(str(lead_id)),
+                role="assistant_outbound_stub",
+                body=text[:4000],
+                metadata={"channel": "whatsapp", "source": "appointment_endpoint"},
+            )
+        except Exception:
+            logger.exception("Falha ao registrar outbound no histórico do lead.")
+
+
+def _build_confirm_message(appt: dict[str, Any], team_id: str | None) -> str:
+    slot_label = repo.SLOT_LABELS.get(str(appt.get("slot") or ""), str(appt.get("slot") or ""))
+    data = _format_scheduled_date(appt.get("scheduled_date"))
+    if team_id:
+        return (
+            f"✅ Confirmado pra {data} das {slot_label}! "
+            f"A equipe {team_id} vai te atender — te aviso quando saírem pra aí."
+        )
+    return (
+        f"✅ Seu agendamento foi confirmado pra {data} das {slot_label}! "
+        "A equipe técnica vai te avisar no dia quando sair pra aí."
+    )
+
+
+def _build_realloc_message(appt: dict[str, Any]) -> str:
+    nome = _lead_first_name(appt)
+    saudacao = f"Oi {nome}!" if nome else "Oi!"
+    slot_label = repo.SLOT_LABELS.get(str(appt.get("slot") or ""), str(appt.get("slot") or ""))
+    data = _format_scheduled_date(appt.get("scheduled_date"))
+    return (
+        f"{saudacao} Precisamos ajustar seu agendamento pra {data} das {slot_label}. "
+        "Tudo bem? (responde SIM ou NÃO)"
+    )
+
+
+def _build_cancel_message(appt: dict[str, Any], reason: str | None) -> str:
+    nome = _lead_first_name(appt)
+    saudacao = f"Oi {nome}," if nome else "Oi,"
+    motivo = ""
+    if reason and str(reason).strip():
+        motivo = f" ({str(reason).strip()})"
+    return (
+        f"{saudacao} precisei cancelar seu agendamento{motivo}. "
+        "Se quiser remarcar, é só me chamar aqui."
+    )
+
+
+def _load_appointment_or_404(appointment_id: str) -> tuple[uuid.UUID, dict[str, Any]]:
+    try:
+        aid = uuid.UUID(appointment_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="appointment_id inválido") from exc
+    existing = repo.get_appointment(aid)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Appointment não encontrado")
+    return aid, existing
+
+
+@app.post("/appointments/{appointment_id}/confirm")
+async def confirm_appointment(
+    appointment_id: str,
+    body: _ConfirmBody | None = None,
+) -> dict[str, Any]:
+    body = body or _ConfirmBody()
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    team_id = (body.team_id or "").strip() or None
+    try:
+        updated = repo.update_appointment_status(
+            aid,
+            status="confirmed",
+            team_id=team_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Carrega versão enriquecida (com dados do lead) para montar a mensagem.
+    enriched = repo.get_appointment(aid) or {**_existing, **updated}
+    message = _build_confirm_message(enriched, team_id)
+    _notify_lead_whatsapp(enriched, message)
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "message_sent": message,
+    }
+
+
+@app.post("/appointments/{appointment_id}/realloc")
+async def realloc_appointment(
+    appointment_id: str,
+    body: _ReallocBody,
+) -> dict[str, Any]:
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    new_date = _parse_br_date(body.new_date)
+    new_slot = str(body.new_slot or "").strip()
+    if new_slot not in repo.SLOT_LABELS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Slot inválido: {new_slot}. "
+                f"Use um de {list(repo.SLOT_LABELS)}."
+            ),
+        )
+    try:
+        updated = repo.update_appointment_status(
+            aid,
+            status="realloc",
+            scheduled_date=new_date,
+            slot=new_slot,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    enriched = repo.get_appointment(aid) or {**_existing, **updated}
+    message = _build_realloc_message(enriched)
+    _notify_lead_whatsapp(enriched, message)
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "message_sent": message,
+    }
+
+
+@app.post("/appointments/{appointment_id}/cancel")
+async def cancel_appointment(
+    appointment_id: str,
+    body: _CancelBody | None = None,
+) -> dict[str, Any]:
+    body = body or _CancelBody()
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    try:
+        updated = repo.update_appointment_status(aid, status="cancelled")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    enriched = repo.get_appointment(aid) or {**_existing, **updated}
+    message = _build_cancel_message(enriched, body.reason)
+    _notify_lead_whatsapp(enriched, message)
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "message_sent": message,
+    }
+
+
+# -----------------------------------------------------------------------------
+# H — Recall 6m pós-conclusão
+# -----------------------------------------------------------------------------
+
+RECALL_6M_DAYS = 180
+RECALL_6M_JOB_TYPE = "followup_recall_6m"
+
+
+def schedule_recall_6m_for_lead(lead_id: uuid.UUID | str) -> str | None:
+    """Enfileira um job `followup_recall_6m` para daqui 180 dias.
+
+    Idempotente: a chave `recall6m_{lead_id}` evita duplicar se o appointment
+    for marcado como completed mais de uma vez (ex: duplo clique no painel).
+    Retorna o job_id (string) ou None se já existia.
+    """
+    lid = lead_id if isinstance(lead_id, uuid.UUID) else uuid.UUID(str(lead_id))
+    run_at = datetime.now(timezone.utc) + timedelta(days=RECALL_6M_DAYS)
+    idem = f"recall6m_{lid}"
+    jid = repo.enqueue_job(
+        lid,
+        RECALL_6M_JOB_TYPE,
+        run_at,
+        {"reason": "appointment_completed", "offer_amount_brl": 280.0},
+        idem,
+    )
+    if jid is not None:
+        try:
+            repo.append_message(
+                lid,
+                "tool",
+                f"{RECALL_6M_JOB_TYPE} agendado para {run_at.isoformat()}",
+            )
+        except Exception:  # pragma: no cover — log-only side effect
+            logger.exception("append_message falhou pro recall 6m lead=%s", lid)
+    return str(jid) if jid else None
+
+
+@app.post("/appointments/{appointment_id}/complete")
+async def complete_appointment(appointment_id: str) -> dict[str, Any]:
+    """Marca appointment como concluído e agenda recall de 6 meses.
+
+    Chamado pelo painel interno quando o técnico confirma que o serviço foi
+    executado. Efeitos: status=completed + job `followup_recall_6m` com
+    `run_at = now + 180 dias` (oferta limpeza de manutenção R$ 280).
+    """
+    aid, _existing = _load_appointment_or_404(appointment_id)
+    try:
+        updated = repo.update_appointment_status(aid, status="completed")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    lead_id_raw = updated.get("lead_id") or _existing.get("lead_id")
+    recall_job_id: str | None = None
+    if lead_id_raw:
+        try:
+            recall_job_id = schedule_recall_6m_for_lead(str(lead_id_raw))
+        except Exception:
+            logger.exception(
+                "Falha ao agendar recall 6m para lead=%s (appointment=%s)",
+                lead_id_raw,
+                aid,
+            )
+    return {
+        "status": "ok",
+        "appointment": updated,
+        "recall_6m_job_id": recall_job_id,
+    }
+
 

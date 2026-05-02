@@ -44,8 +44,14 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_paused_reason TEXT;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_reactivated_at TIMESTAMPTZ;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS bot_reactivated_by TEXT;
 
+-- FIX-MAPS: lat/lng são fonte da verdade da localização (pin enviado pelo cliente).
+-- Texto de endereço vira opcional/fallback. NUMERIC com precisão para coordenadas GPS.
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS latitude NUMERIC(10, 7);
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS longitude NUMERIC(10, 7);
+
 CREATE INDEX IF NOT EXISTS leads_stage_idx ON leads (stage);
 CREATE INDEX IF NOT EXISTS leads_quote_sent_idx ON leads (quote_sent_at) WHERE quote_sent_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS leads_bot_paused_idx ON leads (bot_paused) WHERE bot_paused = true;
 
 CREATE TABLE IF NOT EXISTS messages (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -57,6 +63,36 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS messages_lead_created_idx ON messages (lead_id, created_at);
+
+-- I/1: Idempotência de webhooks WhatsApp.
+-- Provider manda o mesmo message_id em retries — registramos o id e fazemos
+-- INSERT ... ON CONFLICT DO NOTHING pra skip de duplicatas.
+CREATE TABLE IF NOT EXISTS processed_messages (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider_message_id     TEXT NOT NULL,
+    lead_id                 UUID REFERENCES leads(id) ON DELETE SET NULL,
+    received_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at            TIMESTAMPTZ,
+    CONSTRAINT processed_messages_provider_id_unique UNIQUE (provider_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS processed_messages_received_at_idx
+    ON processed_messages (received_at DESC);
+
+-- G: histórico de estágios do lead (tempo em cada estágio do funil).
+CREATE TABLE IF NOT EXISTS lead_stage_history (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    lead_id     UUID NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    stage       TEXT NOT NULL,
+    entered_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    exited_at   TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS lead_stage_history_lead_idx
+    ON lead_stage_history (lead_id, entered_at DESC);
+CREATE INDEX IF NOT EXISTS lead_stage_history_open_idx
+    ON lead_stage_history (lead_id)
+    WHERE exited_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS appointments (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -70,6 +106,20 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 
 CREATE INDEX IF NOT EXISTS appointments_lead_idx ON appointments (lead_id);
+
+-- F2+A4: engine de agendamento com slots fixos.
+-- slot_enum: morning_early (8-10), morning_late (10-12),
+-- afternoon_early (14-16), afternoon_late (16-18).
+-- status novo: pending_team_assignment (humano atribui equipe depois).
+-- DESIGN DECISION: mantemos window_label como string legado + scheduled_date/slot estruturados.
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS scheduled_date DATE;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS slot TEXT;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS team_id TEXT;
+
+CREATE INDEX IF NOT EXISTS appointments_date_slot_idx
+    ON appointments (scheduled_date, slot)
+    WHERE scheduled_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS appointments_status_idx ON appointments (status);
 
 -- Fila de automações: idempotency_key UNIQUE evita WhatsApp/Telegram duplicado ao reprocessar.
 CREATE TABLE IF NOT EXISTS automation_jobs (

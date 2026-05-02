@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -47,6 +47,8 @@ FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
     "manutencao_preventiva": 200.0,
     "carga_gas_revisao": 180.0,
     "visita_tecnica_gratis": 0.0,
+    # H — limpeza de manutenção promocional 6m pós-conclusão.
+    "limpeza_recall_6m": 280.0,
 }
 
 
@@ -252,6 +254,26 @@ def get_pricing_quote(
     else:
         st = raw.replace(" ", "_").replace("ção", "cao")
     # aliases
+    if st in ("limpeza_recall_6m", "recall_6m", "manutencao_recall_6m"):
+        # H — oferta promocional pós-recall 6 meses.
+        return _finalize_ok_quote(
+            tool_context,
+            "limpeza_recall_6m",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 280.0,
+                "labor_brl": 280.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Limpeza de manutenção promocional (cliente retorno 6 meses): "
+                    "R$ 280,00 — valor especial. Inclui higienização completa + "
+                    "revisão geral. Técnicos credenciados com ART, 3 meses de "
+                    "garantia. São Luís."
+                ),
+            },
+        )
     if st in ("limpeza", "higienizacao"):
         return _finalize_ok_quote(
             tool_context,
@@ -264,10 +286,10 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Limpeza/higienização padrão: a partir de R$ 200,00 (valor estimado, "
-                    "pode variar conforme o caso no local). Limpeza profunda interna "
-                    "(sujeira, mofo, bactérias). Técnicos credenciados com ART, fardados, "
-                    "3 meses de garantia no serviço. Válido em São Luís."
+                    "Limpeza/higienização padrão: na faixa de R$ 200,00 — o técnico confirma "
+                    "o valor final na hora depois de avaliar as condições. Limpeza profunda "
+                    "interna (sujeira, mofo, bactérias). Técnicos credenciados com ART, "
+                    "fardados, 3 meses de garantia no serviço. Válido em São Luís."
                 ),
             },
         )
@@ -283,8 +305,9 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Manutenção preventiva: a partir de R$ 200,00 (São Luís). "
-                    "Técnicos credenciados com ART, fardados, 3 meses de garantia."
+                    "Manutenção preventiva: na faixa de R$ 200,00 — o técnico confirma o "
+                    "valor final na hora. Técnicos credenciados com ART, fardados, 3 meses "
+                    "de garantia. São Luís."
                 ),
             },
         )
@@ -299,7 +322,10 @@ def get_pricing_quote(
                 "labor_brl": 180.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
-                "summary": "Carga de gás + revisão: a partir de R$ 180,00 (São Luís).",
+                "summary": (
+                    "Carga de gás + revisão: na faixa de R$ 180,00 — o técnico confirma o "
+                    "valor final na hora. São Luís."
+                ),
             },
         )
 
@@ -315,9 +341,10 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Visita técnica presencial gratuita para avaliação (sem orçamento remoto "
-                    "nesse caso). Indicado: cassete/piso-teto, quebra de teto/fiação, não gela/"
-                    "vazamento, cliente não sabe explicar o problema. São Luís."
+                    "Caso que precisa de avaliação presencial antes de fechar valor "
+                    "(técnico vai no local). Indicado: cassete/piso-teto, quebra de "
+                    "teto/fiação, não gela/vazamento, cliente não sabe explicar o problema. "
+                    "São Luís."
                 ),
             },
         )
@@ -360,8 +387,9 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Para evitar erro no diagnóstico, vamos de visita técnica gratuita. "
-                    "Assim avaliamos o local com segurança e te passamos o melhor cenário."
+                    "Pra evitar erro no diagnóstico, o técnico precisa passar aí pra avaliar "
+                    "no local antes de fechar valor. Assim a gente garante que não tem "
+                    "surpresa no orçamento."
                 ),
             },
         )
@@ -379,8 +407,8 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Nesse caso, precisamos de visita técnica presencial gratuita antes de "
-                    "passar orçamento, pois há necessidade de quebra estrutural/fiação."
+                    "Nesse caso, o técnico precisa passar aí pra avaliar antes de passar "
+                    "valor, porque tem necessidade de quebra estrutural/fiação."
                 ),
             },
         )
@@ -409,8 +437,8 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Se o acesso ainda não está claro, seguimos com visita técnica gratuita. "
-                    "É o caminho mais seguro para fechar o orçamento sem erro."
+                    "Como o acesso ainda não está claro, o técnico precisa passar aí pra "
+                    "avaliar no local. É o caminho mais seguro pra fechar o orçamento sem erro."
                 ),
             },
         )
@@ -427,8 +455,8 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Para instalação com acesso complexo (altura/andaime/área externa), "
-                    "vamos de visita técnica gratuita para avaliar com segurança."
+                    "Pra instalação com acesso complexo (altura/andaime/área externa), "
+                    "o técnico precisa passar aí pra avaliar no local antes de fechar valor."
                 ),
             },
         )
@@ -441,18 +469,22 @@ def get_pricing_quote(
 
     total = labor + tubing_extra
     labor_note = "instalação padrão com acesso fácil (térreo/sacada/varanda)"
-    parts = [f"Mão de obra instalação Ilha Breeze: R$ {labor:.0f} ({labor_note})."]
+    parts = [
+        f"Mão de obra instalação Ilha Breeze: na faixa de R$ {labor:.0f} "
+        f"({labor_note}) — o técnico confirma o valor final na hora."
+    ]
     if own is False:
         parts.append(
-            "Cliente sem tubulação: material ~2 m ≈ R$ 200. "
-            f"Total indicativo ≈ R$ {total:.0f} (mão de obra + material), sem margem em peça."
+            "Cliente sem tubulação: material ~2 m na faixa de R$ 200. "
+            f"Total indicativo na faixa de R$ {total:.0f} (mão de obra + material), "
+            "sem margem em peça."
         )
     elif own is True:
-        parts.append("Cliente já tem tubulação: cobrar só mão de obra conforme regra acima.")
+        parts.append("Cliente já tem tubulação: cobra só mão de obra conforme regra acima.")
     else:
         parts.append(
-            "Se o cliente já tiver tubulação, segue só mão de obra (R$ 300). "
-            "Sem tubulação, some ~R$ 200 de material (transparente, sem margem)."
+            "Se o cliente já tiver tubulação, segue só mão de obra (na faixa de R$ 300). "
+            "Sem tubulação, some uns R$ 200 de material (transparente, sem margem)."
         )
 
     parts.append(
@@ -852,3 +884,209 @@ def get_lead_status(tool_context: ToolContext) -> dict[str, Any]:
         }
     except DatabaseNotConfiguredError as e:
         return _db_error(e)
+
+
+# =============================================================================
+# F2+A4: Tools de agendamento com slots fixos (check_availability / book_slot)
+# =============================================================================
+# DESIGN DECISION: essas tools são a interface do LLM com a engine de slots
+# já implementada em repository.py. Elas NÃO tomam decisão de negócio própria —
+# só traduzem data humana (DD/MM/AAAA) -> datetime.date, chamam o repository,
+# e montam `tell_client` em PT-BR pronto pro modelo ler ao cliente.
+
+def _parse_ddmmyyyy(value: str) -> _date | None:
+    """Converte 'DD/MM/AAAA' -> date. Retorna None se inválido."""
+    raw = (value or "").strip()
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", raw)
+    if not m:
+        return None
+    day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return _date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _format_free_slots_pt(slots: dict[str, bool]) -> str:
+    """Monta lista humana de slots livres, ex.: '8h-10h, 14h-16h e 16h-18h'."""
+    labels = [
+        lead_repo.SLOT_LABELS[s]
+        for s in lead_repo.SLOTS_ORDER
+        if slots.get(s)
+    ]
+    # Troca '08h-10h' por '8h-10h' para ficar natural em PT-BR.
+    labels = [lbl.lstrip("0") if lbl.startswith("0") else lbl for lbl in labels]
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} e {labels[1]}"
+    return ", ".join(labels[:-1]) + f" e {labels[-1]}"
+
+
+def check_availability(date: str, tool_context: ToolContext) -> dict[str, Any]:
+    """
+    Consulta disponibilidade de slots (manhã/tarde) numa data específica.
+
+    Args:
+        date: data no formato DD/MM/AAAA (ex.: "05/05/2026").
+
+    Returns:
+        status: ok/error;
+        date: data solicitada (DD/MM/AAAA);
+        slots: dict com cada slot -> "livre" ou "ocupado";
+        slot_labels: dict com rótulo humano de cada slot (ex.: "08h-10h");
+        tell_client: string pronta em PT-BR para o LLM ler ao cliente.
+    """
+    # DESIGN DECISION: `tool_context` é aceito (padrão das outras tools) mas não
+    # é estritamente necessário aqui — checagem de slot é global por data, não
+    # por lead. Mantido para uniformidade do registry ADK.
+    del tool_context  # não usado; apenas parte da assinatura ADK.
+    parsed = _parse_ddmmyyyy(date)
+    if parsed is None:
+        return {
+            "status": "error",
+            "message": f"Data inválida: {date!r}. Use formato DD/MM/AAAA.",
+            "tell_client": (
+                "Me confirma a data desejada no formato dia/mês/ano (ex.: 05/05/2026), "
+                "por favor?"
+            ),
+        }
+    try:
+        slots_bool = lead_repo.check_slot_availability(parsed)
+    except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
+        return _db_error(e)
+
+    slots_str = {
+        slot: ("livre" if free else "ocupado")
+        for slot, free in slots_bool.items()
+    }
+    slot_labels = dict(lead_repo.SLOT_LABELS)
+    date_human = parsed.strftime("%d/%m/%Y")
+    free_any = any(slots_bool.values())
+    if not free_any:
+        tell_client = (
+            f"No dia {date_human} já estou com 4 atendimentos marcados. "
+            "Tem outro dia bom pra ti?"
+        )
+    else:
+        free_list = _format_free_slots_pt(slots_bool)
+        tell_client = (
+            f"No dia {date_human} tenho livres: {free_list}. Qual prefere?"
+        )
+    return {
+        "status": "ok",
+        "date": date_human,
+        "slots": slots_str,
+        "slot_labels": slot_labels,
+        "tell_client": tell_client,
+    }
+
+
+def book_slot(
+    date: str,
+    slot: str,
+    tool_context: ToolContext,
+    notes: str = "",
+) -> dict[str, Any]:
+    """
+    Reserva um slot específico (DD/MM/AAAA + slot) para o lead atual.
+
+    Args:
+        date: data no formato DD/MM/AAAA.
+        slot: um de morning_early | morning_late | afternoon_early | afternoon_late.
+        notes: observações livres (opcional).
+
+    Returns:
+        status: ok/error;
+        appointment_id: uuid do agendamento criado (quando ok);
+        date, slot, slot_label: eco dos dados confirmados;
+        tell_client: mensagem pronta em PT-BR;
+        requires_team_assignment: sempre True (equipe é atribuída depois por humano).
+    """
+    parsed = _parse_ddmmyyyy(date)
+    if parsed is None:
+        return {
+            "status": "error",
+            "message": f"Data inválida: {date!r}. Use formato DD/MM/AAAA.",
+            "tell_client": (
+                "Me confirma a data no formato dia/mês/ano (ex.: 05/05/2026), por favor?"
+            ),
+        }
+    slot_key = (slot or "").strip()
+    if slot_key not in lead_repo.SLOT_LABELS:
+        return {
+            "status": "error",
+            "message": (
+                f"Slot inválido: {slot!r}. Use um de "
+                f"{list(lead_repo.SLOT_LABELS)}."
+            ),
+            "tell_client": (
+                "Qual horário prefere: 8h-10h, 10h-12h, 14h-16h ou 16h-18h?"
+            ),
+        }
+    try:
+        lead_id = _resolve_lead_id(tool_context)
+        appt = lead_repo.create_slot_appointment(
+            lead_id,
+            appointment_date=parsed,
+            slot=slot_key,
+            notes=notes or "",
+        )
+    except (DatabaseNotConfiguredError, DatabaseUnavailableError) as e:
+        return _db_error(e)
+    except ValueError as e:
+        # Slot ocupado ou dia cheio — mensagem amigável ao cliente.
+        msg = str(e)
+        low = msg.lower()
+        date_human = parsed.strftime("%d/%m/%Y")
+        if "já está com 4" in msg or "4 atendimentos" in low:
+            tell = (
+                f"Poxa, o dia {date_human} já fechou com 4 atendimentos. "
+                "Tem outro dia bom pra ti?"
+            )
+        else:
+            label = lead_repo.SLOT_LABELS.get(slot_key, slot_key)
+            label_human = label.lstrip("0") if label.startswith("0") else label
+            tell = (
+                f"O horário das {label_human} do dia {date_human} acabou de ser "
+                "reservado. Posso ver outro horário nesse mesmo dia?"
+            )
+        return {"status": "error", "message": msg, "tell_client": tell}
+    except LookupError as e:
+        return {"status": "error", "message": str(e)}
+
+    # Best effort: avança o funil e etiqueta o chat (não bloqueia retorno).
+    try:
+        _advance_lead_to_scheduled(lead_id)
+    except Exception:
+        logger.exception("Falha ao avançar funil após book_slot lead=%s", lead_id)
+    try:
+        lead_repo.append_message(
+            lead_id,
+            "tool",
+            f"book_slot {parsed.isoformat()} slot={slot_key}",
+        )
+    except Exception:
+        logger.exception("Falha ao registrar mensagem de book_slot lead=%s", lead_id)
+    _label_lead_chat(lead_id, "agendado")
+
+    slot_label = lead_repo.SLOT_LABELS[slot_key]
+    slot_label_human = slot_label.lstrip("0") if slot_label.startswith("0") else slot_label
+    date_human = parsed.strftime("%d/%m/%Y")
+    date_short = parsed.strftime("%d/%m")
+    tell_client = (
+        f"Prontinho! Agendamento marcado pra {date_short} das {slot_label_human}. "
+        "Nossa equipe confirma qual técnico vai atender até amanhã. "
+        "Qualquer coisa te aviso por aqui!"
+    )
+    return {
+        "status": "ok",
+        "appointment_id": str(appt.get("id")),
+        "date": date_human,
+        "slot": slot_key,
+        "slot_label": slot_label,
+        "tell_client": tell_client,
+        "requires_team_assignment": True,
+    }

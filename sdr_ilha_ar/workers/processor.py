@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sdr_ilha_ar import repository as lead_repo
@@ -78,6 +78,43 @@ def _process_send_followup(job: dict[str, Any]) -> None:
         pl = raw_pl if isinstance(raw_pl, dict) else {}
     template = pl.get("template", "followup")
     tag = pl.get("followup_tag")
+
+    # G: gate do follow-up amarrado ao estágio.
+    # A cadência (45min, 1h, 5h, 1d, 3d) é contada a partir do momento em que o
+    # lead entrou em 'quoted' — não da última mensagem. Se o lead:
+    #   (a) não está mais em 'quoted' (avançou ou voltou a estágio anterior), pula;
+    #   (b) está em 'quoted' há menos tempo que o threshold (ex: reentrou), pula;
+    # Isso evita disparar cupom R$50 em lead que já agendou ou que acabou de
+    # ser requotado. Templates legados ficam isentos da checagem.
+    cadence_thresholds = {
+        "followup_45min": timedelta(minutes=45),
+        "followup_1h": timedelta(hours=1),
+        "followup_5h": timedelta(hours=5),
+        "followup_1d": timedelta(days=1),
+        "followup_3d": timedelta(days=3),
+    }
+    threshold = cadence_thresholds.get(template)
+    if threshold is not None:
+        current_stage = lead.get("stage")
+        if current_stage != "quoted":
+            logger.info(
+                "[send_followup] lead=%s template=%s pulado — estagio atual=%s (nao e quoted)",
+                lead_id, template, current_stage,
+            )
+            return
+        quoted_dur = lead_repo.get_stage_duration_for(lead_id, "quoted")
+        if quoted_dur is None:
+            # Sem histórico (lead antigo pré-migration). Segue o fluxo.
+            logger.info(
+                "[send_followup] lead=%s template=%s sem historico de quoted, prosseguindo",
+                lead_id, template,
+            )
+        elif quoted_dur < threshold:
+            logger.info(
+                "[send_followup] lead=%s template=%s pulado — quoted ha %s < threshold %s",
+                lead_id, template, quoted_dur, threshold,
+            )
+            return
 
     # Mensagens por template da cadência nova.
     # As mensagens começam com [FOLLOWUP:<tag>] pra que o agente (quando re-engajar
@@ -215,6 +252,46 @@ def _process_six_month_cleaning_followup(job: dict[str, Any]) -> None:
         {"job_id": str(job["id"])},
     )
 
+
+def _process_followup_recall_6m(job: dict[str, Any]) -> None:
+    """H — Recall 6 meses pós-conclusão.
+
+    Disparado 180 dias após marcar appointment como completed. Regras:
+    - Se lead não existe mais: pula.
+    - Se lead já tem appointment ativo (pending/proposed/confirmed/realloc): pula
+      (não queremos oferta de recall colidindo com atendimento em curso).
+    - Caso contrário, grava mensagem com prefixo [FOLLOWUP:6m_recall] pra que o
+      agente LLM adapte o tom e ofereça limpeza de manutenção por R$ 280.
+    """
+    lead_id = uuid.UUID(str(job["lead_id"]))
+    lead = lead_repo.get_lead(lead_id)
+    if not lead:
+        logger.info("[followup_recall_6m] lead=%s nao existe, pulado", lead_id)
+        return
+
+    # Evita colidir com atendimento em andamento.
+    try:
+        active = lead_repo.list_active_appointments_for_lead(lead_id)
+    except AttributeError:
+        # Compat: instalação antiga sem a helper ainda — segue o fluxo.
+        active = []
+    if active:
+        logger.info(
+            "[followup_recall_6m] lead=%s tem %d appointment(s) ativo(s), pulado",
+            lead_id,
+            len(active),
+        )
+        return
+
+    name = lead.get("display_name") or "Cliente"
+    msg = (
+        f"[FOLLOWUP:6m_recall] E aí {name}! Passou 6 meses desde o último "
+        f"serviço. Tô liberando uma limpeza de manutenção promocional por "
+        f"R$ 280 (valor especial cliente retorno). Quer que eu agende?"
+    )
+    logger.info("[followup_recall_6m] lead=%s disparando oferta R$280", lead_id)
+    lead_repo.append_message(lead_id, "assistant_outbound_stub", msg)
+
 def process_job(job: dict[str, Any]) -> None:
     jid = uuid.UUID(str(job["id"]))
     jtype = job["job_type"]
@@ -231,6 +308,8 @@ def process_job(job: dict[str, Any]) -> None:
             _process_abandonment_check(job)
         elif jtype == "six_month_cleaning_followup":
             _process_six_month_cleaning_followup(job)
+        elif jtype == "followup_recall_6m":
+            _process_followup_recall_6m(job)
         else:
             raise ValueError(f"job_type desconhecido: {jtype}")
         lead_repo.complete_job(jid)
