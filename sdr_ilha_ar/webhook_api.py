@@ -22,7 +22,13 @@ from sdr_ilha_ar import repository as repo
 
 app = FastAPI(title="SDR Ilha Ar Webhook API", version="1.0.0")
 logger = logging.getLogger(__name__)
-DEBOUNCE_SECONDS = 12
+# I/2 — Inbox único com debounce de 20s.
+# Mensagens do mesmo lead (mesma conversation_key) que chegam dentro dessa
+# janela são agregadas numa única chamada ao LLM, evitando múltiplas respostas
+# quando o cliente manda "oi", "tudo bem?", "preciso de orçamento" em poucos
+# segundos. Implementação em memória (asyncio.Task por conversa) — funciona
+# com uma réplica; pra escalar horizontal troca pra Redis/Postgres.
+DEBOUNCE_SECONDS = 20
 
 
 @app.exception_handler(psycopg.ProgrammingError)
