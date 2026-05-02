@@ -689,6 +689,42 @@ async def get_lead_bot_status(lead_id: str) -> dict[str, Any]:
     }
 
 
+# =============================================================================
+# G — Informações de funil: estágio atual, duração, histórico.
+# =============================================================================
+
+
+@app.get("/leads/{lead_id}/stage-info")
+async def get_lead_stage_info(lead_id: str) -> dict[str, Any]:
+    """Retorna info de funil do lead: estágio atual, entered_at, duração (s) e histórico.
+
+    Usado pelo frontend pra renderizar badge "Em '{stage}' há {duration_human}".
+    """
+    lid = uuid.UUID(lead_id)
+    lead = repo.get_lead(lid)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead não encontrado")
+    history = repo.get_stage_history(lid)
+    duration = repo.get_current_stage_duration(lid)
+    # entered_at do estágio corrente = última entrada em history que bate com stage atual e está aberta.
+    entered_at = None
+    current_stage = lead.get("stage")
+    for row in reversed(history):
+        if row.get("stage") == current_stage and row.get("exited_at") is None:
+            entered_at = row.get("entered_at")
+            break
+    if entered_at is None and history:
+        # fallback: último registro (caso linha esteja fechada por algum motivo)
+        entered_at = history[-1].get("entered_at")
+    return {
+        "lead_id": str(lead["id"]),
+        "current_stage": current_stage,
+        "entered_at": entered_at,
+        "duration_seconds": int(duration.total_seconds()) if duration is not None else None,
+        "history": history,
+    }
+
+
 @app.post("/leads/{lead_id}/bot/reactivate")
 async def reactivate_lead_bot(lead_id: str) -> dict[str, Any]:
     lid = uuid.UUID(lead_id)
