@@ -1186,14 +1186,12 @@ def _notify_lead_whatsapp(appt: dict[str, Any], text: str) -> None:
 def _build_confirm_message(appt: dict[str, Any], team_id: str | None) -> str:
     slot_label = repo.SLOT_LABELS.get(str(appt.get("slot") or ""), str(appt.get("slot") or ""))
     data = _format_scheduled_date(appt.get("scheduled_date"))
-    if team_id:
-        return (
-            f"✅ Confirmado pra {data} das {slot_label}! "
-            f"A equipe {team_id} vai te atender — te aviso quando saírem pra aí."
-        )
+    # Não expomos UUID interno do team_id pro cliente — mensagem uniforme,
+    # humana e clara. Se um dia houver tabela teams com nome, fazer lookup aqui.
+    _ = team_id
     return (
         f"✅ Seu agendamento foi confirmado pra {data} das {slot_label}! "
-        "A equipe técnica vai te avisar no dia quando sair pra aí."
+        "Nossa equipe técnica te avisa no dia quando sair pra aí."
     )
 
 
