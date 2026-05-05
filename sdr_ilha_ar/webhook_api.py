@@ -1306,13 +1306,171 @@ def schedule_recall_6m_for_lead(lead_id: uuid.UUID | str) -> str | None:
     return str(jid) if jid else None
 
 
+@app.post("/appointments/manual")
+async def create_manual_appointment(request: Request) -> dict[str, Any]:
+    """Cria lead legado + appointment manual num único passo.
+
+    Usado pelo painel humano (front-end) pra cadastrar clientes que já tinham
+    agendamento antes do sistema existir. Efeitos:
+      - INSERT em `leads` com external_channel='manual', bot_paused=true
+        (o agente IA NUNCA vai falar com esse lead — é só registro legado)
+      - INSERT em `appointments` com status='pending_team_assignment' e campos
+        scheduled_date/slot (ou custom_time pra horário fora dos 4 slots fixos)
+
+    Request body:
+        {
+          "lead": {
+            "display_name": "João Silva",       # obrigatório
+            "phone": "+5598999999999",           # opcional
+            "address": "Rua X, 123",             # opcional
+            "service_type": "instalacao",        # opcional
+            "btus": 12000,                       # opcional
+            "floor_level": 3,                    # opcional
+            "quoted_amount": 450.00,             # opcional
+            "notes": "Cliente legado, ligou..."  # opcional (vai pra quote_notes)
+          },
+          "appointment": {
+            "scheduled_date": "2026-05-10",      # obrigatório (YYYY-MM-DD)
+            "slot": "morning_early",             # opcional (1 dos 4 slots fixos)
+            "custom_time": "11:30",              # opcional (hora livre legada)
+            "team_id": "abc-uuid",               # opcional (humano atribui depois)
+            "notes": "Visita remarcada 2x"       # opcional
+          }
+        }
+
+    Returns 201 com o appointment criado + lead_id.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="JSON inválido.") from exc
+
+    lead_data = body.get("lead") or {}
+    appt_data = body.get("appointment") or {}
+
+    # --- Validações mínimas ---
+    display_name = (lead_data.get("display_name") or "").strip()
+    if not display_name:
+        raise HTTPException(
+            status_code=400,
+            detail="lead.display_name é obrigatório.",
+        )
+
+    scheduled_date_raw = appt_data.get("scheduled_date")
+    if not scheduled_date_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="appointment.scheduled_date é obrigatório (formato YYYY-MM-DD).",
+        )
+    try:
+        scheduled_date = date_cls.fromisoformat(str(scheduled_date_raw))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="appointment.scheduled_date inválido. Use YYYY-MM-DD.",
+        ) from exc
+
+    slot = appt_data.get("slot") or None
+    if slot and slot not in repo.SLOT_LABELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"appointment.slot inválido. Valores aceitos: {list(repo.SLOT_LABELS.keys())}",
+        )
+
+    custom_time = (appt_data.get("custom_time") or "").strip() or None
+    if not slot and not custom_time:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe appointment.slot OU appointment.custom_time.",
+        )
+
+    # --- Normaliza tipos opcionais ---
+    def _to_int(v: Any) -> int | None:
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _to_float(v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # --- Cria lead ---
+    try:
+        lead_id = repo.create_lead_manual(
+            display_name=display_name,
+            phone=(lead_data.get("phone") or None),
+            address=(lead_data.get("address") or None),
+            service_type=(lead_data.get("service_type") or None),
+            btus=_to_int(lead_data.get("btus")),
+            floor_level=_to_int(lead_data.get("floor_level")),
+            quoted_amount=_to_float(lead_data.get("quoted_amount")),
+            notes=(lead_data.get("notes") or None),
+        )
+    except Exception as exc:
+        logger.exception("create_lead_manual falhou body=%s", lead_data)
+        raise HTTPException(status_code=500, detail=f"Falha ao criar lead: {exc}") from exc
+
+    # --- Cria appointment ---
+    try:
+        appointment = repo.create_appointment_manual(
+            lead_id=lead_id,
+            scheduled_date=scheduled_date,
+            slot=slot,
+            custom_time=custom_time,
+            team_id=(appt_data.get("team_id") or None),
+            notes=(appt_data.get("notes") or None),
+        )
+    except Exception as exc:
+        logger.exception("create_appointment_manual falhou lead=%s body=%s", lead_id, appt_data)
+        raise HTTPException(status_code=500, detail=f"Falha ao criar appointment: {exc}") from exc
+
+    # Normaliza tipos pra JSON (date/datetime → str)
+    def _jsonable(v: Any) -> Any:
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        if isinstance(v, uuid.UUID):
+            return str(v)
+        return v
+
+    appointment_clean = {k: _jsonable(v) for k, v in appointment.items()}
+
+    logger.info(
+        "create_manual_appointment ok lead=%s appointment=%s date=%s slot=%s custom=%s",
+        lead_id,
+        appointment_clean.get("id"),
+        scheduled_date,
+        slot,
+        custom_time,
+    )
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "status": "ok",
+            "lead_id": str(lead_id),
+            "appointment": appointment_clean,
+        },
+    )
+
+
 @app.post("/appointments/{appointment_id}/complete")
 async def complete_appointment(appointment_id: str) -> dict[str, Any]:
     """Marca appointment como concluído e agenda recall de 6 meses.
 
     Chamado pelo painel interno quando o técnico confirma que o serviço foi
-    executado. Efeitos: status=completed + job `followup_recall_6m` com
-    `run_at = now + 180 dias` (oferta limpeza de manutenção R$ 280).
+    executado. Efeitos:
+      - status=completed
+      - job `followup_recall_6m` com `run_at = now + 180 dias` (oferta limpeza R$ 280)
+      - job `notify_internal` IMEDIATO com tag [CONCLUÍDO] avisando o grupo/admin
+        (BUG FIX: antes só atualizava o DB sem notificar — ninguém sabia que
+        a visita foi finalizada).
     """
     aid, _existing = _load_appointment_or_404(appointment_id)
     try:
@@ -1323,7 +1481,10 @@ async def complete_appointment(appointment_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     lead_id_raw = updated.get("lead_id") or _existing.get("lead_id")
     recall_job_id: str | None = None
+    notify_job_id: str | None = None
     if lead_id_raw:
+        lead_uuid = uuid.UUID(str(lead_id_raw))
+        # Recall 6 meses (já existia)
         try:
             recall_job_id = schedule_recall_6m_for_lead(str(lead_id_raw))
         except Exception:
@@ -1332,10 +1493,44 @@ async def complete_appointment(appointment_id: str) -> dict[str, Any]:
                 lead_id_raw,
                 aid,
             )
+        # BUG FIX: notificar o grupo/admin que o serviço foi concluído
+        try:
+            window_label = updated.get("window_label") or _existing.get("window_label") or "—"
+            notes_val = updated.get("notes") or _existing.get("notes") or ""
+            scheduled_date = updated.get("scheduled_date") or _existing.get("scheduled_date")
+            slot = updated.get("slot") or _existing.get("slot")
+            date_slot_line = ""
+            if scheduled_date:
+                date_slot_line = f"Data/slot: {scheduled_date}"
+                if slot:
+                    date_slot_line += f" · {slot}"
+            notify_payload: dict[str, Any] = {
+                "tag": "[CONCLUÍDO]",
+                "title": "VISITA TÉCNICA CONCLUÍDA",
+                "window_label": window_label,
+            }
+            if notes_val:
+                notify_payload["notes"] = notes_val
+            if date_slot_line:
+                notify_payload["reason"] = date_slot_line
+            ret = repo.enqueue_job(
+                lead_id=lead_uuid,
+                job_type="notify_internal",
+                run_at=datetime.now(timezone.utc),
+                payload=notify_payload,
+                idempotency_key=f"notify_completed:{aid}",
+            )
+            notify_job_id = str(ret) if ret else None
+        except Exception:
+            logger.exception(
+                "Falha ao enfileirar notify_internal de conclusão (appointment=%s)",
+                aid,
+            )
     return {
         "status": "ok",
         "appointment": updated,
         "recall_6m_job_id": recall_job_id,
+        "notify_job_id": notify_job_id,
     }
 
 
