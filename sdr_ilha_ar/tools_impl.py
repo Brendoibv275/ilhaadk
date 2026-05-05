@@ -47,7 +47,7 @@ FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
     "manutencao_preventiva": 180.0,
     "carga_gas_revisao": 180.0,
     "desinstalacao": 150.0,
-    "visita_tecnica_gratis": 0.0,
+    "visita_tecnica_gratis": 300.0,
     # H — limpeza de manutenção promocional 6m pós-conclusão.
     "limpeza_recall_6m": 280.0,
 }
@@ -366,20 +366,22 @@ def get_pricing_quote(
         )
 
     if st in ("visita_tecnica_gratis", "visita_gratis", "defeito", "manutencao_corretiva"):
+        # Regra dono: NUNCA mais cotação zerada. Toda visita tem estimativa mínima.
+        # Faixa típica de diagnóstico + serviço corretivo: R$ 200 a R$ 400.
         return _finalize_ok_quote(
             tool_context,
             st,
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 0.0,
-                "labor_brl": 0.0,
+                "amount_brl": 300.0,
+                "labor_brl": 300.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Caso que precisa de avaliação presencial antes de fechar valor "
-                    "(técnico vai no local). Indicado: cassete/piso-teto, quebra de "
-                    "teto/fiação, não gela/vazamento, cliente não sabe explicar o problema. "
+                    "Diagnóstico + serviço corretivo: estimado entre R$ 200 e R$ 400 "
+                    "(média R$ 300). Técnico confirma na hora depois de avaliar. "
+                    "Casos comuns: não gela, vazamento, cassete/piso-teto, ruído. "
                     "São Luís."
                 ),
             },
@@ -412,25 +414,26 @@ def get_pricing_quote(
             wall_or_wiring = True
 
     if wall_or_wiring is None:
+        # Regra dono: sempre dar estimativa. Assumir fácil acesso como baseline.
         return _finalize_ok_quote(
             tool_context,
-            "visita_tecnica_gratis",
+            "instalacao",
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 0.0,
-                "labor_brl": 0.0,
-                "materials_tubing_brl": 0.0,
+                "amount_brl": 500.0,
+                "labor_brl": 300.0,
+                "materials_tubing_brl": 200.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Pra evitar erro no diagnóstico, o técnico precisa passar aí pra avaliar "
-                    "no local antes de fechar valor. Assim a gente garante que não tem "
-                    "surpresa no orçamento."
+                    "Instalação: estimado R$ 300 mão de obra + R$ 200 material "
+                    "(total ~R$ 500). Se precisar quebrar parede/teto ou mexer "
+                    "em fiação, pode subir — técnico confirma na hora. São Luís."
                 ),
             },
         )
 
-    # Regra crítica: se envolver quebra de parede/teto ou fiação, não orçar remoto.
+    # Regra crítica: se envolver quebra de parede/teto ou fiação, estimativa majorada.
     if wall_or_wiring is True:
         return _finalize_ok_quote(
             tool_context,
@@ -438,13 +441,14 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 0.0,
-                "labor_brl": 0.0,
-                "materials_tubing_brl": 0.0,
+                "amount_brl": 700.0,
+                "labor_brl": 500.0,
+                "materials_tubing_brl": 200.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Nesse caso, o técnico precisa passar aí pra avaliar antes de passar "
-                    "valor, porque tem necessidade de quebra estrutural/fiação."
+                    "Instalação com quebra de parede/teto ou fiação: estimado "
+                    "entre R$ 600 e R$ 900 (média R$ 700). Mão de obra majorada "
+                    "pela complexidade. Técnico confirma o valor final na hora."
                 ),
             },
         )
@@ -462,19 +466,21 @@ def get_pricing_quote(
     needs_scaf = _pt_sim(needs_scaffold_exterior)
     easy = _pt_sim(easy_access)
     if easy is None:
+        # Regra dono: sempre dar estimativa. Assumir fácil acesso como baseline.
         return _finalize_ok_quote(
             tool_context,
-            "visita_tecnica_gratis",
+            "instalacao",
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 0.0,
-                "labor_brl": 0.0,
-                "materials_tubing_brl": 0.0,
+                "amount_brl": 500.0,
+                "labor_brl": 300.0,
+                "materials_tubing_brl": 200.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Como o acesso ainda não está claro, o técnico precisa passar aí pra "
-                    "avaliar no local. É o caminho mais seguro pra fechar o orçamento sem erro."
+                    "Instalação: estimado R$ 300 mão de obra + R$ 200 material "
+                    "(total ~R$ 500). Se for acesso difícil (sem varanda/janela), "
+                    "vai adicionar andaime/escada — técnico confirma na hora. São Luís."
                 ),
             },
         )
@@ -497,22 +503,23 @@ def get_pricing_quote(
             elif 2 <= inferred_floor <= MAX_SCAFFOLD_FLOOR:
                 equip_raw = "andaime"
 
-        # Acima do 4º → Ilha Breeze não atende com andaime. Encaminha humano/visita.
+        # Acima do 4º → Ilha Breeze não atende com andaime da UZI, mas dá estimativa.
         if inferred_floor is not None and inferred_floor > MAX_SCAFFOLD_FLOOR:
             return _finalize_ok_quote(
                 tool_context,
-                "visita_tecnica_gratis",
+                "instalacao",
                 {
                     "status": "ok",
                     "currency": "BRL",
-                    "amount_brl": 0.0,
-                    "labor_brl": 0.0,
-                    "materials_tubing_brl": 0.0,
+                    "amount_brl": 600.0,
+                    "labor_brl": 400.0,
+                    "materials_tubing_brl": 200.0,
                     "scaffold_rental_client_brl": None,
                     "summary": (
-                        f"Acima do {MAX_SCAFFOLD_FLOOR}º andar a Ilha Breeze não atende "
-                        "com andaime da UZI. Um humano da equipe vai entrar em contato "
-                        "pra ver uma alternativa."
+                        f"Acima do {MAX_SCAFFOLD_FLOOR}º andar a UZI não tem andaime "
+                        "padrão. Estimativa inicial: R$ 600 (mão de obra + material), "
+                        "sem contar equipamento especial (andaime alto/cesto). "
+                        "Um humano da equipe vai confirmar cotação do equipamento."
                     ),
                 },
             )
@@ -528,21 +535,22 @@ def get_pricing_quote(
 
         if equip_raw == "andaime":
             if inferred_floor is None:
-                # Sem andar informado → peça o andar antes de cotar.
+                # Sem andar informado → dá estimativa média da tabela e pede o andar.
                 return _finalize_ok_quote(
                     tool_context,
-                    "visita_tecnica_gratis",
+                    "instalacao",
                     {
                         "status": "ok",
                         "currency": "BRL",
-                        "amount_brl": 0.0,
-                        "labor_brl": 0.0,
+                        "amount_brl": 570.0,
+                        "labor_brl": 400.0,
                         "materials_tubing_brl": 0.0,
-                        "scaffold_rental_client_brl": None,
+                        "scaffold_rental_client_brl": 170.0,
                         "summary": (
-                            "Pra cotar com andaime preciso saber o andar "
-                            f"(1 a {MAX_SCAFFOLD_FLOOR}). Pergunta pro cliente e chama "
-                            "a tool de novo com scaffold_floor preenchido."
+                            "Instalação com andaime: estimado entre R$ 520 (1º andar) e "
+                            "R$ 650 (4º andar). Média R$ 570 = mão de obra R$ 400 + "
+                            "andaime UZI ~R$ 170 (3º andar). Pergunte o andar pro cliente "
+                            "pra cotar exato. ⚠️ Agendamento com andaime: mínimo 48h."
                         ),
                     },
                 )
@@ -553,20 +561,22 @@ def get_pricing_quote(
             equipment_cost = LADDER_PRICE_BRL
             equipment_label = "escada (2 lances)"
         else:
-            # Sem equipamento determinado e acesso genuinamente incerto → só aí visita.
+            # Sem equipamento determinado → estimativa média assumindo andaime 2º andar.
             return _finalize_ok_quote(
                 tool_context,
-                "visita_tecnica_gratis",
+                "instalacao",
                 {
                     "status": "ok",
                     "currency": "BRL",
-                    "amount_brl": 0.0,
-                    "labor_brl": 0.0,
+                    "amount_brl": 540.0,
+                    "labor_brl": 400.0,
                     "materials_tubing_brl": 0.0,
-                    "scaffold_rental_client_brl": None,
+                    "scaffold_rental_client_brl": 140.0,
                     "summary": (
-                        "Acesso não foi possível determinar por descrição/foto. "
-                        "Visita técnica pra avaliar no local."
+                        "Instalação em acesso difícil: estimado R$ 540 "
+                        "(mão de obra R$ 400 + andaime UZI ~R$ 140 para 2º andar). "
+                        "Pergunte o andar pro cliente pra cotar exato. "
+                        "⚠️ Agendamento com andaime: mínimo 48h."
                     ),
                 },
             )
