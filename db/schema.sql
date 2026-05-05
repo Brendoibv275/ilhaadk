@@ -115,6 +115,10 @@ CREATE INDEX IF NOT EXISTS appointments_lead_idx ON appointments (lead_id);
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS scheduled_date DATE;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS slot TEXT;
 ALTER TABLE appointments ADD COLUMN IF NOT EXISTS team_id TEXT;
+-- J: agendamento manual (clientes legados pré-sistema). custom_time permite
+-- hora exata fora dos 4 slots fixos (ex.: "11:30") pra o agente respeitar
+-- horários legados ao propor novos.
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS custom_time TEXT;
 
 CREATE INDEX IF NOT EXISTS appointments_date_slot_idx
     ON appointments (scheduled_date, slot)

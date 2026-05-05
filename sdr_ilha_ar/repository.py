@@ -1333,3 +1333,134 @@ def ensure_finance_schema() -> None:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS finance_entries_due_idx ON finance_entries (due_date)"
             )
+
+
+# =============================================================================
+# J: Agendamento manual (clientes legados pré-sistema)
+# =============================================================================
+def create_lead_manual(
+    *,
+    display_name: str,
+    phone: str | None = None,
+    address: str | None = None,
+    service_type: str | None = None,
+    btus: int | None = None,
+    floor_level: int | None = None,
+    quoted_amount: float | None = None,
+    notes: str | None = None,
+) -> uuid.UUID:
+    """Cria um lead originado do painel humano (não veio do WhatsApp).
+
+    - external_channel='manual'
+    - external_user_id único por timestamp (evita colisão sem depender de phone)
+    - bot_paused=true pra o agente NUNCA mandar mensagem pra esse lead legado
+    - stage='scheduled' (é um cliente que já foi marcado, não tem funil)
+    - quote_notes guarda a observação livre (pra aparecer no resumo)
+    """
+    import time
+
+    external_user_id = f"manual:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO leads (
+                    external_channel,
+                    external_user_id,
+                    phone,
+                    display_name,
+                    address,
+                    service_type,
+                    btus,
+                    floor_level,
+                    quoted_amount,
+                    quote_notes,
+                    stage,
+                    bot_paused,
+                    bot_paused_at,
+                    bot_paused_reason,
+                    equipe_responsavel
+                )
+                VALUES (
+                    'manual', %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    'scheduled', TRUE, now(),
+                    'lead_manual_legado', %s
+                )
+                RETURNING id
+                """,
+                (
+                    external_user_id,
+                    phone,
+                    display_name,
+                    address,
+                    service_type,
+                    btus,
+                    floor_level,
+                    quoted_amount,
+                    notes,
+                    settings.equipe_responsavel,
+                ),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            return row["id"]
+
+
+def create_appointment_manual(
+    *,
+    lead_id: uuid.UUID,
+    scheduled_date: date,
+    slot: str | None,
+    custom_time: str | None = None,
+    team_id: str | None = None,
+    notes: str | None = None,
+    status: str = "pending_team_assignment",
+    window_label: str | None = None,
+) -> dict[str, Any]:
+    """Cria appointment manual. Retorna a row completa.
+
+    - status padrão 'pending_team_assignment' (humano confirma equipe depois)
+    - slot é opcional (pra legado com horário livre via custom_time)
+    - window_label é gerado a partir do slot se não vier explícito
+    """
+    if window_label is None:
+        if slot and slot in SLOT_LABELS:
+            window_label = SLOT_LABELS[slot]
+        elif custom_time:
+            window_label = custom_time
+        else:
+            window_label = "—"
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO appointments (
+                    lead_id,
+                    scheduled_date,
+                    slot,
+                    custom_time,
+                    team_id,
+                    notes,
+                    status,
+                    window_label
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, lead_id, scheduled_date, slot, custom_time,
+                          team_id, notes, status, window_label,
+                          calendar_event_id, created_at, updated_at
+                """,
+                (
+                    str(lead_id),
+                    scheduled_date,
+                    slot,
+                    custom_time,
+                    team_id,
+                    notes,
+                    status,
+                    window_label,
+                ),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            return dict(row)
