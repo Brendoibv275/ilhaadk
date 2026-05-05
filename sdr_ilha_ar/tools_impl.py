@@ -72,6 +72,9 @@ LADDER_PRICE_BRL = 100.0
 LABOR_COMPLEX_BRL = 400.0
 # Mão de obra padrão (fácil acesso).
 LABOR_EASY_BRL = 300.0
+# Adicional de periculosidade — pago ao técnico por trabalhar em altura.
+# Fixo: R$ 70 em TODA instalação que usa andaime ou escada.
+PERICULOSIDADE_BRL = 70.0
 
 
 def _resolve_lead_id(tool_context: ToolContext) -> uuid.UUID:
@@ -167,16 +170,25 @@ def _extract_first_date_ddmmyyyy(value: str) -> datetime | None:
 
 
 def get_current_datetime() -> dict[str, Any]:
-    """Retorna data/hora atual de São Luís para orientar agendamentos relativos."""
+    """Retorna data/hora atual de São Luís para orientar agendamentos relativos.
+
+    CHAME ESTA TOOL SEMPRE antes de dizer "hoje" ou "amanhã" ou qualquer data.
+    Nunca assuma qual é o dia atual — use o valor retornado aqui.
+    """
     now_br = datetime.now(timezone.utc).astimezone(BR_TZ)
     return {
         "status": "ok",
-        "timezone": "America/Fortaleza",
+        "timezone": "America/Fortaleza (UTC-3, mesmo fuso de São Luís/MA)",
         "date": now_br.strftime("%d/%m/%Y"),
         "time": now_br.strftime("%H:%M"),
         "iso": now_br.isoformat(),
         "weekday": now_br.strftime("%A"),
-        "hint": "Use estes valores como referência para hoje/amanhã e horários.",
+        "hint": (
+            f"HOJE é {now_br.strftime('%d/%m/%Y')}. "
+            f"AMANHÃ é {(now_br + timedelta(days=1)).strftime('%d/%m/%Y')}. "
+            f"DEPOIS DE AMANHÃ é {(now_br + timedelta(days=2)).strftime('%d/%m/%Y')}. "
+            "Use ESTES valores — não chute data."
+        ),
     }
 
 
@@ -511,15 +523,16 @@ def get_pricing_quote(
                 {
                     "status": "ok",
                     "currency": "BRL",
-                    "amount_brl": 600.0,
-                    "labor_brl": 400.0,
+                    "amount_brl": 670.0,
+                    "labor_brl": 470.0,  # 400 + 70 periculosidade
                     "materials_tubing_brl": 200.0,
                     "scaffold_rental_client_brl": None,
                     "summary": (
                         f"Acima do {MAX_SCAFFOLD_FLOOR}º andar a UZI não tem andaime "
-                        "padrão. Estimativa inicial: R$ 600 (mão de obra + material), "
-                        "sem contar equipamento especial (andaime alto/cesto). "
-                        "Um humano da equipe vai confirmar cotação do equipamento."
+                        "padrão. Estimativa inicial: R$ 670 (mão de obra R$ 400 + "
+                        "periculosidade R$ 70 + material R$ 200), sem contar "
+                        "equipamento especial (andaime alto/cesto). Um humano da "
+                        "equipe vai confirmar cotação do equipamento."
                     ),
                 },
             )
@@ -536,21 +549,23 @@ def get_pricing_quote(
         if equip_raw == "andaime":
             if inferred_floor is None:
                 # Sem andar informado → dá estimativa média da tabela e pede o andar.
+                # Todos os cenários já incluem +R$ 70 periculosidade.
                 return _finalize_ok_quote(
                     tool_context,
                     "instalacao",
                     {
                         "status": "ok",
                         "currency": "BRL",
-                        "amount_brl": 570.0,
-                        "labor_brl": 400.0,
+                        "amount_brl": 640.0,  # 400 + 70 + 170 (média 3º andar)
+                        "labor_brl": 470.0,   # 400 + 70 periculosidade
                         "materials_tubing_brl": 0.0,
                         "scaffold_rental_client_brl": 170.0,
                         "summary": (
-                            "Instalação com andaime: estimado entre R$ 520 (1º andar) e "
-                            "R$ 650 (4º andar). Média R$ 570 = mão de obra R$ 400 + "
-                            "andaime UZI ~R$ 170 (3º andar). Pergunte o andar pro cliente "
-                            "pra cotar exato. ⚠️ Agendamento com andaime: mínimo 48h."
+                            "Instalação com andaime: estimado entre R$ 590 (1º andar) e "
+                            "R$ 720 (4º andar). Média R$ 640 = mão de obra R$ 400 + "
+                            "periculosidade R$ 70 + andaime UZI ~R$ 170 (3º andar). "
+                            "Pergunte o andar pro cliente pra cotar exato. "
+                            "⚠️ Agendamento com andaime: mínimo 48h."
                         ),
                     },
                 )
@@ -568,13 +583,14 @@ def get_pricing_quote(
                 {
                     "status": "ok",
                     "currency": "BRL",
-                    "amount_brl": 540.0,
-                    "labor_brl": 400.0,
+                    "amount_brl": 610.0,  # 400 + 70 + 140 (2º andar)
+                    "labor_brl": 470.0,   # 400 + 70 periculosidade
                     "materials_tubing_brl": 0.0,
                     "scaffold_rental_client_brl": 140.0,
                     "summary": (
-                        "Instalação em acesso difícil: estimado R$ 540 "
-                        "(mão de obra R$ 400 + andaime UZI ~R$ 140 para 2º andar). "
+                        "Instalação em acesso difícil: estimado R$ 610 "
+                        "(mão de obra R$ 400 + periculosidade R$ 70 + "
+                        "andaime UZI ~R$ 140 para 2º andar). "
                         "Pergunte o andar pro cliente pra cotar exato. "
                         "⚠️ Agendamento com andaime: mínimo 48h."
                     ),
@@ -585,7 +601,8 @@ def get_pricing_quote(
         tubing_extra = 0.0
         if own is False:
             tubing_extra = 200.0
-        total = labor + tubing_extra + equipment_cost
+        # Adicional de periculosidade: R$ 70 fixo sempre que usa andaime/escada.
+        total = labor + tubing_extra + equipment_cost + PERICULOSIDADE_BRL
 
         tubing_part = (
             " + tubulação R$ 200" if own is False else ""
@@ -597,12 +614,13 @@ def get_pricing_quote(
                 "status": "ok",
                 "currency": "BRL",
                 "amount_brl": round(total, 2),
-                "labor_brl": round(labor, 2),
+                "labor_brl": round(labor + PERICULOSIDADE_BRL, 2),
                 "materials_tubing_brl": round(tubing_extra, 2),
                 "scaffold_rental_client_brl": round(equipment_cost, 2),
                 "summary": (
                     f"Instalação com {equipment_label}: R$ {total:.0f} total "
                     f"(mão de obra R$ {labor:.0f}{tubing_part} + "
+                    f"periculosidade R$ {PERICULOSIDADE_BRL:.0f} + "
                     f"{equipment_label} R$ {equipment_cost:.0f}). "
                     "⚠️ Agendamento com andaime/escada: mínimo 48h de antecedência "
                     "pra garantir disponibilidade do equipamento."
