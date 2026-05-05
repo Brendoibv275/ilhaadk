@@ -69,15 +69,38 @@ def _send_text_to_destination(number_or_jid: str, text: str, *, instance_hint: s
 
 
 def send_admin_whatsapp_message(text: str, *, instance_hint: str = "") -> dict[str, Any]:
-    """Envia mensagem ao WhatsApp do admin usando a Evolution API configurada."""
-    admin_number = settings.admin_whatsapp_number
-    if not admin_number:
+    """Envia mensagem ao WhatsApp do admin usando a Evolution API configurada.
+
+    ADMIN_WHATSAPP_NUMBER pode conter múltiplos números separados por vírgula
+    (ex.: "5598984666860,5598985818664") — nesse caso envia pra todos.
+    Retorna status=ok se pelo menos um envio foi bem sucedido; status=error
+    se todos falharam; status=skipped se nenhum número configurado.
+    """
+    raw = settings.admin_whatsapp_number or ""
+    admin_numbers = [n.strip() for n in raw.split(",") if n.strip()]
+    if not admin_numbers:
         logger.warning(
             "ADMIN_WHATSAPP_NUMBER ausente; notificação não enviada: %s",
             text[:500],
         )
         return {"status": "skipped", "reason": "admin_number_not_configured"}
-    return _send_text_to_destination(admin_number, text, instance_hint=instance_hint)
+
+    results: list[dict[str, Any]] = []
+    any_ok = False
+    for number in admin_numbers:
+        result = _send_text_to_destination(number, text, instance_hint=instance_hint)
+        results.append({"number": number, "result": result})
+        if result.get("status") == "ok":
+            any_ok = True
+
+    if len(admin_numbers) == 1:
+        # Compat: quando só 1 número, mantém shape antigo (plano pros testes).
+        return results[0]["result"]
+    return {
+        "status": "ok" if any_ok else "error",
+        "recipients": len(admin_numbers),
+        "results": results,
+    }
 
 
 def send_internal_notification_message(text: str, *, external_channel: str | None = None) -> dict[str, Any]:

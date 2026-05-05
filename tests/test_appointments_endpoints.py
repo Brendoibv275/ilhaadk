@@ -130,7 +130,9 @@ def test_confirm_com_team(client, appt_id, mock_repo_and_send):
     body = resp.json()
     assert body["appointment"]["team_id"] == "equipe-azul"
     msg = body["message_sent"]
-    assert "equipe equipe-azul" in msg
+    # team_id fica salvo no appointment, mas a msg NÃO expõe UUID/ID pro cliente.
+    assert "Nossa equipe técnica" in msg
+    assert "equipe-azul" not in msg  # nunca vazar identificador interno
     assert "05/05/2026" in msg
     assert mock_repo_and_send["updates"] == [
         {"status": "confirmed", "team_id": "equipe-azul"}
