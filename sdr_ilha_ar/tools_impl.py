@@ -43,13 +43,35 @@ WEEKDAY_PT = {
 }
 
 FIXED_SERVICE_QUOTES_BRL: dict[str, float] = {
-    "higienizacao": 200.0,
-    "manutencao_preventiva": 200.0,
+    "higienizacao": 180.0,
+    "manutencao_preventiva": 180.0,
     "carga_gas_revisao": 180.0,
+    "desinstalacao": 150.0,
     "visita_tecnica_gratis": 0.0,
     # H — limpeza de manutenção promocional 6m pós-conclusão.
     "limpeza_recall_6m": 280.0,
 }
+
+# Desconto máximo de negociação: cliente reclamou do preço pode receber -R$ 50.
+# Só aplicar quando agente explicitamente decidir negociar (não automático).
+NEGOTIATION_DISCOUNT_BRL = 50.0
+
+# UZI Andaimes — parceiro oficial da Ilha Breeze em São Luís.
+# Jeito B: valor é embutido no orçamento total da Ilha Breeze (cliente paga único).
+# Acima do 4º andar a Ilha Breeze NÃO atende com andaime.
+SCAFFOLD_PRICES_BY_FLOOR_BRL: dict[int, float] = {
+    1: 120.0,
+    2: 140.0,
+    3: 170.0,
+    4: 250.0,
+}
+MAX_SCAFFOLD_FLOOR = 4
+# Escada 2 lances (1º andar, acesso externo simples).
+LADDER_PRICE_BRL = 100.0
+# Mão de obra quando precisa de equipamento de acesso (andaime/escada): R$ 300 + R$ 100 adicional.
+LABOR_COMPLEX_BRL = 400.0
+# Mão de obra padrão (fácil acesso).
+LABOR_EASY_BRL = 300.0
 
 
 def _resolve_lead_id(tool_context: ToolContext) -> uuid.UUID:
@@ -223,6 +245,7 @@ def get_pricing_quote(
     easy_access: str | None = None,
     floor_level: int | None = None,
     tubing_complex: str | None = None,
+    access_equipment: str | None = None,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """
@@ -234,15 +257,17 @@ def get_pricing_quote(
         btus: potência (instalação). 9k–12k no pacote base; acima de 18k regra especial.
         has_own_tubing: sim/nao — cliente já tem tubulação? Se não, material ~R$ 200 (2 m).
         requires_wall_or_wiring: sim/nao — precisa quebrar parede/teto ou fazer fiação.
-        needs_scaffold_exterior: sim/nao — andaime ou escada alta por fora do prédio.
-        scaffold_floor: 1, 2 ou 3 — andar para aluguel do andaime (pago à parte pelo cliente).
+        needs_scaffold_exterior: sim/nao — precisa equipamento de acesso externo.
+        scaffold_floor: 1 a 4 — andar para aluguel do andaime (embutido no total).
         easy_access: sim = térreo, sacada, varanda (acesso fácil); nao = mais difícil.
-        floor_level: legado; se scaffold_floor vazio e for 1–3, pode alinhar com andaime.
+        floor_level: legado; se scaffold_floor vazio e for 1–4, pode alinhar com andaime.
         tubing_complex: legado; se disser "sem"/"média", ajuda a inferir tubulação.
+        access_equipment: "andaime" | "escada" | None. Quando sem varanda e sem janela viável,
+            o agente deve inferir equipamento (escada só para 1º andar simples; andaime nos demais).
 
     Returns:
-        amount_brl estimativa principal (mão de obra + material quando couber);
-        scaffold_rental_client_brl separado (cliente paga direto ao fornecedor).
+        amount_brl total Ilha Breeze (mão de obra + material + equipamento, pagamento único);
+        scaffold_rental_client_brl mantido para referência interna do andaime embutido.
 
     Quando `tool_context` é fornecido pelo ADK, grava `service_type` e `quoted_amount` no lead.
     """
@@ -281,15 +306,12 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 200.0,
-                "labor_brl": 200.0,
+                "amount_brl": 180.0,
+                "labor_brl": 180.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Limpeza/higienização padrão: na faixa de R$ 200,00 — o técnico confirma "
-                    "o valor final na hora depois de avaliar as condições. Limpeza profunda "
-                    "interna (sujeira, mofo, bactérias). Técnicos credenciados com ART, "
-                    "fardados, 3 meses de garantia no serviço. Válido em São Luís."
+                    "Limpeza/higienização: R$ 180. Técnico confirma na hora. São Luís."
                 ),
             },
         )
@@ -300,14 +322,12 @@ def get_pricing_quote(
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 200.0,
-                "labor_brl": 200.0,
+                "amount_brl": 180.0,
+                "labor_brl": 180.0,
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Manutenção preventiva: na faixa de R$ 200,00 — o técnico confirma o "
-                    "valor final na hora. Técnicos credenciados com ART, fardados, 3 meses "
-                    "de garantia. São Luís."
+                    "Manutenção preventiva: R$ 180. Técnico confirma na hora. São Luís."
                 ),
             },
         )
@@ -323,8 +343,24 @@ def get_pricing_quote(
                 "materials_tubing_brl": 0.0,
                 "scaffold_rental_client_brl": None,
                 "summary": (
-                    "Carga de gás + revisão: na faixa de R$ 180,00 — o técnico confirma o "
-                    "valor final na hora. São Luís."
+                    "Carga de gás + revisão: R$ 180. Técnico confirma na hora. São Luís."
+                ),
+            },
+        )
+    if st in ("desinstalacao", "desinstalação", "retirar", "tirar_ar"):
+        return _finalize_ok_quote(
+            tool_context,
+            "desinstalacao",
+            {
+                "status": "ok",
+                "currency": "BRL",
+                "amount_brl": 150.0,
+                "labor_brl": 150.0,
+                "materials_tubing_brl": 0.0,
+                "scaffold_rental_client_brl": None,
+                "summary": (
+                    "Desinstalação: R$ 150. Se precisar de andaime/escada pelo andar, "
+                    "soma o equipamento (UZI). Técnico confirma na hora. São Luís."
                 ),
             },
         )
@@ -444,59 +480,146 @@ def get_pricing_quote(
         )
 
     if needs_scaf is True or easy is False:
+        # Jeito B: cota na hora com equipamento embutido no total Ilha Breeze.
+        equip_raw = (access_equipment or "").strip().lower()
+        # Inferência do andar a partir de scaffold_floor > floor_level.
+        inferred_floor: int | None = None
+        if isinstance(scaffold_floor, int) and scaffold_floor > 0:
+            inferred_floor = scaffold_floor
+        elif isinstance(floor_level, int) and floor_level > 0:
+            inferred_floor = floor_level
+
+        # Inferência de equipamento se o agente não passou:
+        # 1º andar simples → escada; 2º-4º → andaime; acima disso, visita.
+        if not equip_raw and inferred_floor is not None:
+            if inferred_floor == 1:
+                equip_raw = "escada"
+            elif 2 <= inferred_floor <= MAX_SCAFFOLD_FLOOR:
+                equip_raw = "andaime"
+
+        # Acima do 4º → Ilha Breeze não atende com andaime. Encaminha humano/visita.
+        if inferred_floor is not None and inferred_floor > MAX_SCAFFOLD_FLOOR:
+            return _finalize_ok_quote(
+                tool_context,
+                "visita_tecnica_gratis",
+                {
+                    "status": "ok",
+                    "currency": "BRL",
+                    "amount_brl": 0.0,
+                    "labor_brl": 0.0,
+                    "materials_tubing_brl": 0.0,
+                    "scaffold_rental_client_brl": None,
+                    "summary": (
+                        f"Acima do {MAX_SCAFFOLD_FLOOR}º andar a Ilha Breeze não atende "
+                        "com andaime da UZI. Um humano da equipe vai entrar em contato "
+                        "pra ver uma alternativa."
+                    ),
+                },
+            )
+
+        # Escada → só 1º andar.
+        if equip_raw == "escada":
+            if inferred_floor is not None and inferred_floor != 1:
+                # escada só serve pro 1º; se informaram andar diferente, corrige pra andaime.
+                equip_raw = "andaime"
+            else:
+                equipment_cost = LADDER_PRICE_BRL
+                equipment_label = "escada (2 lances)"
+
+        if equip_raw == "andaime":
+            if inferred_floor is None:
+                # Sem andar informado → peça o andar antes de cotar.
+                return _finalize_ok_quote(
+                    tool_context,
+                    "visita_tecnica_gratis",
+                    {
+                        "status": "ok",
+                        "currency": "BRL",
+                        "amount_brl": 0.0,
+                        "labor_brl": 0.0,
+                        "materials_tubing_brl": 0.0,
+                        "scaffold_rental_client_brl": None,
+                        "summary": (
+                            "Pra cotar com andaime preciso saber o andar "
+                            f"(1 a {MAX_SCAFFOLD_FLOOR}). Pergunta pro cliente e chama "
+                            "a tool de novo com scaffold_floor preenchido."
+                        ),
+                    },
+                )
+            equipment_cost = SCAFFOLD_PRICES_BY_FLOOR_BRL[inferred_floor]
+            equipment_label = f"andaime {inferred_floor}º andar"
+        elif equip_raw == "escada":
+            # Reafirmação do caso escada (para quando caiu no elif inicial).
+            equipment_cost = LADDER_PRICE_BRL
+            equipment_label = "escada (2 lances)"
+        else:
+            # Sem equipamento determinado e acesso genuinamente incerto → só aí visita.
+            return _finalize_ok_quote(
+                tool_context,
+                "visita_tecnica_gratis",
+                {
+                    "status": "ok",
+                    "currency": "BRL",
+                    "amount_brl": 0.0,
+                    "labor_brl": 0.0,
+                    "materials_tubing_brl": 0.0,
+                    "scaffold_rental_client_brl": None,
+                    "summary": (
+                        "Acesso não foi possível determinar por descrição/foto. "
+                        "Visita técnica pra avaliar no local."
+                    ),
+                },
+            )
+
+        labor = LABOR_COMPLEX_BRL
+        tubing_extra = 0.0
+        if own is False:
+            tubing_extra = 200.0
+        total = labor + tubing_extra + equipment_cost
+
+        tubing_part = (
+            " + tubulação R$ 200" if own is False else ""
+        )
         return _finalize_ok_quote(
             tool_context,
-            "visita_tecnica_gratis",
+            "instalacao",
             {
                 "status": "ok",
                 "currency": "BRL",
-                "amount_brl": 0.0,
-                "labor_brl": 0.0,
-                "materials_tubing_brl": 0.0,
-                "scaffold_rental_client_brl": None,
+                "amount_brl": round(total, 2),
+                "labor_brl": round(labor, 2),
+                "materials_tubing_brl": round(tubing_extra, 2),
+                "scaffold_rental_client_brl": round(equipment_cost, 2),
                 "summary": (
-                    "Pra instalação com acesso complexo (altura/andaime/área externa), "
-                    "o técnico precisa passar aí pra avaliar no local antes de fechar valor."
+                    f"Instalação com {equipment_label}: R$ {total:.0f} total "
+                    f"(mão de obra R$ {labor:.0f}{tubing_part} + "
+                    f"{equipment_label} R$ {equipment_cost:.0f}). "
+                    "⚠️ Agendamento com andaime/escada: mínimo 48h de antecedência "
+                    "pra garantir disponibilidade do equipamento."
                 ),
             },
         )
 
-    labor = 300.0
+    labor = LABOR_EASY_BRL
 
     tubing_extra = 0.0
     if own is False:
         tubing_extra = 200.0
 
     total = labor + tubing_extra
-    labor_note = "instalação padrão com acesso fácil (térreo/sacada/varanda)"
     parts = [
-        f"Mão de obra instalação Ilha Breeze: na faixa de R$ {labor:.0f} "
-        f"({labor_note}) — o técnico confirma o valor final na hora."
+        f"Instalação padrão (acesso fácil): R$ {labor:.0f} mão de obra."
     ]
     if own is False:
         parts.append(
-            "Cliente sem tubulação: material ~2 m na faixa de R$ 200. "
-            f"Total indicativo na faixa de R$ {total:.0f} (mão de obra + material), "
-            "sem margem em peça."
+            f"Sem tubulação: + R$ 200 material. Total R$ {total:.0f}."
         )
     elif own is True:
-        parts.append("Cliente já tem tubulação: cobra só mão de obra conforme regra acima.")
+        parts.append("Cliente já tem tubulação: só a mão de obra.")
     else:
         parts.append(
-            "Se o cliente já tiver tubulação, segue só mão de obra (na faixa de R$ 300). "
-            "Sem tubulação, some uns R$ 200 de material (transparente, sem margem)."
+            "Se tiver tubulação, só mão de obra. Sem tubulação, + R$ 200."
         )
-
-    parts.append(
-        "Diferencial Ilha Breeze: técnicos credenciados com ART (Atestado de Responsabilidade "
-        "Técnica), fardados, com 3 meses de garantia no serviço. Nossa equipe já trabalhou em "
-        "empresas autorizadas (Elgin, Gree, Samsung, LG), então você tem a mesma qualidade "
-        "técnica que autorizada, com preço melhor. Você paga mão de obra e material separado, "
-        "com repasse transparente de peças (sem margem escondida)."
-    )
-    parts.append(
-        "No mercado, muitos pacotes fechados ficam entre R$ 650 e R$ 700 no total."
-    )
 
     return _finalize_ok_quote(
         tool_context,
