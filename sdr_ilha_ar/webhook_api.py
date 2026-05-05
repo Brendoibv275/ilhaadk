@@ -12,6 +12,7 @@ from typing import Any
 from datetime import date as date_cls
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import psycopg
@@ -21,6 +22,27 @@ from sdr_ilha_ar.channel import handle_evolution_inbound, parse_evolution_inboun
 from sdr_ilha_ar import repository as repo
 
 app = FastAPI(title="SDR Ilha Ar Webhook API", version="1.0.0")
+
+# CORS — permite front-ib (Netlify + localhost) bater na API.
+# Origens configuráveis via env CORS_ALLOWED_ORIGINS (csv). Se não definido,
+# aceita dev local + domínio oficial do front. Em prod real, restrinja.
+_cors_env = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
+if _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_origins = [
+        "https://ilhabreese.netlify.app",
+        "http://localhost:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:5173",
+    ]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 logger = logging.getLogger(__name__)
 # I/2 — Inbox único com debounce de 20s.
 # Mensagens do mesmo lead (mesma conversation_key) que chegam dentro dessa
