@@ -23,6 +23,15 @@ from typing import Any
 
 from google import genai
 from google.adk.runners import InMemoryRunner
+try:  # Runner e sessions persistentes só existem no ADK real (não no stub de testes).
+    from google.adk.runners import Runner  # type: ignore
+    from google.adk.sessions import DatabaseSessionService, InMemorySessionService  # type: ignore
+    _ADK_PERSISTENT_AVAILABLE = True
+except ImportError:  # pragma: no cover — ambiente de testes com stub mínimo.
+    Runner = None  # type: ignore
+    DatabaseSessionService = None  # type: ignore
+    InMemorySessionService = None  # type: ignore
+    _ADK_PERSISTENT_AVAILABLE = False
 from google.genai import types
 
 from sdr_ilha_ar.config import settings
@@ -31,7 +40,7 @@ from sdr_ilha_ar import repository as lead_repo
 
 logger = logging.getLogger(__name__)
 
-_runner: InMemoryRunner | None = None
+_runner: "Runner | InMemoryRunner | None" = None
 
 FALLBACK_REPLY = (
     "Recebi sua mensagem certinho. Se puder, me manda novamente para eu confirmar "
@@ -43,10 +52,55 @@ TRANSCRIBE_PROMPT = (
 )
 
 
-def _runner_singleton() -> InMemoryRunner:
+def _build_session_service():
+    """
+    Retorna um SessionService persistente quando possível.
+
+    Se ADK persistente disponível + DATABASE_URL definido → DatabaseSessionService
+    (Postgres/Supabase), pra sessão/histórico sobreviver a restart/deploy/crash.
+    Senão → InMemorySessionService (volátil — apenas dev/testes).
+
+    O DatabaseSessionService cria as tabelas automáticas na primeira execução
+    (via SQLAlchemy create_all): sessions, events, app_states, user_states.
+    """
+    if not _ADK_PERSISTENT_AVAILABLE:
+        return None
+    db_url = (os.environ.get("DATABASE_URL") or "").strip()
+    if not db_url:
+        logger.warning(
+            "DATABASE_URL vazio — usando InMemorySessionService (histórico volátil). "
+            "Defina DATABASE_URL pra persistir conversa no Postgres."
+        )
+        return InMemorySessionService()
+    # SQLAlchemy precisa do driver explícito pra Postgres — converte postgresql://
+    # pra postgresql+psycopg:// caso o usuário só tenha o URI cru do Supabase.
+    if db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+asyncpg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    try:
+        service = DatabaseSessionService(db_url=db_url)
+        logger.info("ADK SessionService persistente (Postgres) inicializado.")
+        return service
+    except Exception:
+        logger.exception(
+            "Falha ao inicializar DatabaseSessionService — fallback pra InMemory. "
+            "Conversa não persistirá entre restarts até corrigir."
+        )
+        return InMemorySessionService()
+
+
+def _runner_singleton():
     global _runner
     if _runner is None:
-        _runner = InMemoryRunner(agent=root_agent, app_name=settings.app_name)
+        if _ADK_PERSISTENT_AVAILABLE and Runner is not None:
+            session_service = _build_session_service()
+            _runner = Runner(
+                app_name=settings.app_name,
+                agent=root_agent,
+                session_service=session_service,
+            )
+        else:
+            # Fallback: ambiente de testes ou ADK sem Runner/DatabaseSessionService.
+            _runner = InMemoryRunner(agent=root_agent, app_name=settings.app_name)
     return _runner
 
 
@@ -149,6 +203,102 @@ def handle_inbound_text_sync(
 
     return asyncio.run(
         handle_inbound_text(
+            external_user_id=external_user_id,
+            text=text,
+            external_channel=external_channel,
+        )
+    )
+
+
+async def note_human_agent_message(
+    *,
+    external_user_id: str,
+    text: str,
+    external_channel: str | None = None,
+) -> None:
+    """
+    Registra uma mensagem ENVIADA PELO HUMANO (atendente) na sessão ADK,
+    SEM disparar resposta do bot.
+
+    Usado quando o atendente pausa o bot e continua a conversa pelo WhatsApp.
+    Quando o bot for reativado, ele terá o histórico completo do que o humano
+    falou, evitando virar "esquizofrênico" (contradizendo o humano).
+
+    Injeta como mensagem de role 'user' com prefixo `[ATENDENTE HUMANO]:` pra
+    o LLM entender que não foi o cliente que mandou.
+    """
+    if not text or not text.strip():
+        return
+
+    runner = _runner_singleton()
+    app_name = runner.app_name
+    channel = external_channel or settings.default_external_channel
+    session_id = external_user_id
+
+    # Garante que a sessão existe (se for a primeira interação humana antes do bot).
+    existing = await runner.session_service.get_session(
+        app_name=app_name,
+        user_id=external_user_id,
+        session_id=session_id,
+    )
+    if existing is None:
+        await runner.session_service.create_session(
+            app_name=app_name,
+            user_id=external_user_id,
+            session_id=session_id,
+        )
+        created = await runner.session_service.get_session(
+            app_name=app_name,
+            user_id=external_user_id,
+            session_id=session_id,
+        )
+        if created is not None:
+            created.state["external_channel"] = channel
+
+    # Tenta anexar evento de nota humana à sessão sem rodar o agente.
+    # Usa append_event se disponível (versões mais novas do ADK), senão fallback.
+    try:
+        from google.adk.events import Event, EventActions  # type: ignore
+
+        session = await runner.session_service.get_session(
+            app_name=app_name,
+            user_id=external_user_id,
+            session_id=session_id,
+        )
+        if session is None:
+            return
+        note_text = f"[ATENDENTE HUMANO respondeu o cliente]: {text.strip()}"
+        content = types.Content(role="user", parts=[types.Part(text=note_text)])
+        event = Event(
+            invocation_id=f"human_note_{uuid.uuid4().hex[:8]}",
+            author="human_agent",
+            content=content,
+            actions=EventActions(),
+        )
+        await runner.session_service.append_event(session, event)
+        logger.info(
+            "Nota de atendente humano registrada na sessão user=%s (%d chars).",
+            external_user_id,
+            len(text),
+        )
+    except Exception:
+        logger.exception(
+            "Falha ao registrar nota do atendente humano na sessão user=%s",
+            external_user_id,
+        )
+
+
+def note_human_agent_message_sync(
+    *,
+    external_user_id: str,
+    text: str,
+    external_channel: str | None = None,
+) -> None:
+    """Versão síncrona de `note_human_agent_message`."""
+    import asyncio
+
+    asyncio.run(
+        note_human_agent_message(
             external_user_id=external_user_id,
             text=text,
             external_channel=external_channel,

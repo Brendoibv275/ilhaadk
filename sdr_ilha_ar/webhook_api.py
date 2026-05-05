@@ -888,6 +888,35 @@ async def webhook_whatsapp(
             )
             confirmed = repo.confirm_latest_appointment_for_lead(lead_id)
             promoted = repo.promote_lead_stage_on_handoff(lead_id)
+            # Persiste o texto COMPLETO do humano (não só stub) — novo role 'human_agent'
+            # pra deixar claro que foi o atendente humano, não o bot nem o cliente.
+            if text:
+                repo.append_message(
+                    lead_id=lead_id,
+                    role="human_agent",
+                    body=text[:4000],
+                    metadata={
+                        "event": "human_agent_message",
+                        "channel": external_channel,
+                    },
+                )
+                # Também injeta na sessão ADK (memória do runner) pra que quando
+                # o bot for reativado, ele saiba o contexto do que o humano falou.
+                # Falha aqui NÃO bloqueia o fluxo — é melhor o texto estar no banco
+                # que nada.
+                try:
+                    from sdr_ilha_ar.channel import note_human_agent_message
+                    await note_human_agent_message(
+                        external_user_id=phone,
+                        text=text,
+                        external_channel=external_channel,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Falha ao registrar nota humana na sessão ADK user=%s",
+                        phone,
+                    )
+            # Mantém o stub event-log pra telemetria (não remove o existente).
             repo.append_message(
                 lead_id=lead_id,
                 role="tool",
