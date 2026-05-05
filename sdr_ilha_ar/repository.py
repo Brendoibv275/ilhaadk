@@ -123,10 +123,11 @@ def _jsonify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def bootstrap_db_schema() -> None:
-    """Aplica ``db/schema.sql`` com ``psql`` (idempotente). Requer cliente no PATH."""
-    if not shutil.which("psql"):
-        logger.warning("psql não encontrado; aplique db/schema.sql manualmente no Postgres")
-        return
+    """Aplica ``db/schema.sql`` no arranque (idempotente).
+
+    Prefere ``psql`` se estiver no PATH; senão executa o ficheiro via ``psycopg``
+    (ex.: Windows sem cliente ``psql`` instalado). Requer ``DATABASE_URL`` válida.
+    """
     try:
         url = _require_url()
     except DatabaseNotConfiguredError:
@@ -138,21 +139,33 @@ def bootstrap_db_schema() -> None:
         logger.warning("db/schema.sql não encontrado em %s", path)
         return
 
-    proc = subprocess.run(
-        ["psql", url, "-f", str(path)],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if proc.returncode != 0:
-        logger.error(
-            "Falha ao aplicar schema (exit %s). stderr=%s stdout=%s",
-            proc.returncode,
-            proc.stderr,
-            proc.stdout,
+    if shutil.which("psql"):
+        proc = subprocess.run(
+            ["psql", url, "-f", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=180,
         )
+        if proc.returncode != 0:
+            logger.error(
+                "Falha ao aplicar schema (exit %s). stderr=%s stdout=%s",
+                proc.returncode,
+                proc.stderr,
+                proc.stdout,
+            )
+            return
+        logger.info("db/schema.sql aplicado (bootstrap via psql)")
         return
-    logger.info("db/schema.sql aplicado (bootstrap)")
+
+    sql = path.read_text(encoding="utf-8")
+    timeout = max(1, settings.db_connect_timeout_seconds)
+    try:
+        with psycopg.connect(url, connect_timeout=timeout, autocommit=True) as conn:
+            conn.execute(sql)
+    except Exception as exc:
+        logger.error("Falha ao aplicar schema via psycopg: %s", exc)
+        return
+    logger.info("db/schema.sql aplicado (bootstrap via psycopg; psql não estava no PATH)")
 
 
 def reconcile_whatsapp_instance_channel(
